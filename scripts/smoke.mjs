@@ -148,7 +148,7 @@ const toolNames = tools.tools.map((tool) => tool.name);
 for (const expected of ['server_config', 'codexpro_self_test', 'codexpro_inventory', 'list_workspaces', 'open_current_workspace', 'open_workspace', 'workspace_snapshot', 'tree', 'search', 'load_skill', 'read', 'write', 'edit', 'bash', 'git_status', 'git_diff', 'show_changes', 'read_handoff', 'codex_context', 'handoff_to_agent', 'handoff_to_codex', 'export_pro_context']) {
   if (!toolNames.includes(expected)) throw new Error(`missing tool: ${expected}`);
 }
-const toolCardUri = 'ui://widget/codexpro-tool-card-v9.html';
+const toolCardUri = 'ui://widget/codexpro-tool-card-v10.html';
 const toolsByName = new Map(tools.tools.map((tool) => [tool.name, tool]));
 function hasWidgetMeta(name) {
   const meta = toolsByName.get(name)?._meta ?? {};
@@ -174,7 +174,7 @@ if (toolCard.mimeType !== 'text/html;profile=mcp-app') throw new Error(`unexpect
 const widget = await client.request('resources/read', { uri: toolCardUri });
 const widgetText = widget.contents?.[0]?.text ?? '';
 const widgetMeta = widget.contents?.[0]?._meta ?? {};
-if (!widgetText.includes('Waiting for tool result') || !widgetText.includes('renderWorkspace') || !widgetText.includes('renderSelfTest') || !widgetText.includes('details class="fold"') || !widgetText.includes('ui/notifications/tool-result')) {
+if (!widgetText.includes('Waiting for tool result') || !widgetText.includes('details class="mini"') || !widgetText.includes('summaryFor') || !widgetText.includes('detailFor') || !widgetText.includes('ui/notifications/tool-result')) {
   throw new Error('tool-card widget resource did not include expected Apps bridge code');
 }
 if (!widgetMeta.ui?.csp || !widgetMeta['openai/widgetCSP']) {

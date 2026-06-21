@@ -40,18 +40,7 @@ function bashTextResult(config: CodexProConfig, result: Awaited<ReturnType<typeo
 
   const stdoutLines = countTextLines(result.stdout);
   const stderrLines = countTextLines(result.stderr);
-  return [
-    "# Bash",
-    "",
-    `\`${result.command}\``,
-    "",
-    `CWD: ${result.cwd}`,
-    `Exit: ${result.exitCode}${result.signal ? ` (${result.signal})` : ""}`,
-    `Duration: ${result.durationMs} ms`,
-    `Output: stdout ${stdoutLines} line${stdoutLines === 1 ? "" : "s"}, stderr ${stderrLines} line${stderrLines === 1 ? "" : "s"}.`,
-    "",
-    "Raw stdout/stderr are in the structured CodexPro card. Start with `--bash-transcript full` to print raw output in chat."
-  ].join("\n");
+  return `Bash: \`${result.command}\` — exit ${result.exitCode}${result.signal ? ` (${result.signal})` : ""}, ${result.durationMs} ms, stdout ${stdoutLines}, stderr ${stderrLines}.`;
 }
 
 function errorResult(error: unknown): any {
@@ -60,6 +49,33 @@ function errorResult(error: unknown): any {
     content: [{ type: "text", text: errorText(error) }],
     structuredContent: { error: errorText(error) }
   };
+}
+
+function textOnlyEnabled(): boolean {
+  return process.env.CODEXPRO_TEXT_ONLY === "1" || process.env.CODEXPRO_DISABLE_TOOL_CARDS === "1";
+}
+
+function compactValue(value: unknown, max = 160): string {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  return text.length > max ? `${text.slice(0, Math.max(0, max - 1))}…` : text;
+}
+
+function compactToolText(name: string, title: unknown, data: Record<string, unknown>): string {
+  const label = String(title || data.codexpro_title || name);
+  if (data.error) return `${label}: ERROR ${compactValue(data.error)}`;
+  if (name === "bash") return `Bash: ${compactValue(data.command, 120)} — exit ${data.exitCode ?? "?"}, ${data.durationMs ?? "?"} ms.`;
+  if (name === "server_config") return `${label}: bash ${data.bashMode ?? "?"}, tools ${data.toolMode ?? "?"}, write ${data.writeMode ?? "?"}, roots ${Array.isArray(data.allowedRoots) ? data.allowedRoots.length : "?"}.`;
+  if (name === "codexpro_self_test") return `${label}: ${data.status ?? "ok"}, ${data.passed ?? 0} passed, ${data.warned ?? 0} warned, ${data.failed ?? 0} failed.`;
+  if (name === "tree") return `${label}: ${compactValue(data.path || data.root || "workspace", 120)} — ${data.entries ?? "?"} entries.`;
+  if (name === "search") return `${label}: ${Array.isArray(data.matches) ? data.matches.length : data.count ?? 0} matches${data.truncated ? " (truncated)" : ""}.`;
+  if (name === "read") return `${label}: ${compactValue(data.path || "file", 140)}${data.startLine && data.endLine ? ` L${data.startLine}-${data.endLine}` : ""}.`;
+  if (name === "write" || name === "edit") return `${label}: ${compactValue(data.path || "file", 120)} +${data.additions ?? 0} -${data.deletions ?? 0}.`;
+  if (name === "git_status") return `${label}: ${Array.isArray(data.changed_files) && data.changed_files.length ? `${data.changed_files.length} changed` : "clean"}.`;
+  if (name === "git_diff") return `${label}: ${data.bytes ?? String(data.diff || "").length} bytes.`;
+  if (name === "show_changes") return `${label}: ${Array.isArray(data.changed_files) && data.changed_files.length ? `${data.changed_files.length} files changed` : "clean"}.`;
+  if (name === "open_current_workspace" || name === "open_workspace" || name === "workspace_snapshot") return `${label}: ${compactValue(data.root || data.path || "workspace", 160)}.`;
+  return `${label}: ${compactValue(data.path || data.root || data.workspace_id || "done", 180)}.`;
 }
 
 function tagToolResult(result: any, name: string, options: Record<string, unknown>): any {
@@ -74,10 +90,14 @@ function tagToolResult(result: any, name: string, options: Record<string, unknow
     codexpro_title: options.title ?? name,
     ...base
   };
+  if (textOnlyEnabled()) {
+    result.content = [{ type: "text", text: compactToolText(name, options.title, result.structuredContent) }];
+  }
   return result;
 }
 
 function toolCardMeta(): Record<string, unknown> {
+  if (process.env.CODEXPRO_TEXT_ONLY === "1" || process.env.CODEXPRO_DISABLE_TOOL_CARDS === "1") return {};
   return {
     ui: { resourceUri: TOOL_CARD_URI },
     "openai/outputTemplate": TOOL_CARD_URI

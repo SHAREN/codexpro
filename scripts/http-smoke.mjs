@@ -292,7 +292,7 @@ try {
       throw new Error(`URL-token MCP tools/list missing ${expected}; got ${queryToolNames.join(', ')}`);
     }
   }
-  const toolCardUri = 'ui://widget/codexpro-tool-card-v9.html';
+  const toolCardUri = 'ui://widget/codexpro-tool-card-v10.html';
   for (const visualTool of queryToolNames) {
     if (!hasWidgetMeta(queryTools, visualTool, toolCardUri)) {
       throw new Error(`${visualTool} should render the CodexPro widget`);
@@ -316,7 +316,7 @@ try {
     const widget = await client.readResource({ uri: toolCardUri });
     const widgetText = widget.contents?.[0]?.text ?? '';
     const widgetMeta = widget.contents?.[0]?._meta ?? {};
-    if (!widgetText.includes('Waiting for tool result') || !widgetText.includes('renderWorkspace') || !widgetText.includes('renderSelfTest') || !widgetText.includes('details class="fold"') || !widgetText.includes('ui/notifications/tool-result')) {
+    if (!widgetText.includes('Waiting for tool result') || !widgetText.includes('details class="mini"') || !widgetText.includes('summaryFor') || !widgetText.includes('detailFor') || !widgetText.includes('ui/notifications/tool-result')) {
       throw new Error('HTTP tool-card widget resource did not include expected Apps bridge code');
     }
     if (!widgetMeta.ui?.csp || !widgetMeta['openai/widgetCSP']) {
