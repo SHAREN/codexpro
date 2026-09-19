@@ -1,7 +1,7 @@
 {
   "name": "codexpro",
   "version": "0.28.5",
-  "description": "A local MCP/App SDK-style connector that lets ChatGPT inspect, edit, and hand off work to Codex inside a local dev workspace.",
+  "description": "A user-authorized local MCP workspace bridge for ChatGPT, scoped to approved project roots for development, maintenance, diagnostics, and automation.",
   "type": "module",
   "license": "MIT",
   "repository": {
