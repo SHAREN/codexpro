@@ -306,7 +306,9 @@ function registerCodexTool(
 
 function serverInstructions(config: CodexProConfig): string {
   return [
-    "CodexPro connects ChatGPT to one local development workspace.",
+    "CodexPro is a user-authorized MCP bridge to the user's own machine and approved workspace roots.",
+    "It is intended for normal development, maintenance, diagnostics, and automation on systems the user owns or is authorized to administer.",
+    config.instanceContext ? `Instance context: ${config.instanceContext}` : "",
     "",
     "Preferred workflow:",
     "1. Start with open_current_workspace. Use open_workspace only when the user gives a different root or asks to switch folders.",
@@ -595,7 +597,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     "server_config",
     {
       title: "Server Config",
-      description: "Show CodexPro server configuration, safety modes, limits, and blocked paths. Does not reveal auth tokens.",
+      description: "Show this user-authorized CodexPro instance configuration, safety modes, limits, approved roots, and blocked paths. Does not reveal auth tokens.",
       inputSchema: {},
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
@@ -611,6 +613,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         host: config.host,
         port: config.port,
         widgetDomain: config.widgetDomain,
+        instanceContext: config.instanceContext ?? null,
         authEnabled: Boolean(config.authToken),
         bashMode: config.bashMode,
         bashTranscript: config.bashTranscript,
