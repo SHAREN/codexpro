@@ -14,6 +14,7 @@ export interface CodexProConfig {
   host: string;
   port: number;
   widgetDomain: string;
+  instanceContext?: string;
   authToken?: string;
   requireHttpToken: boolean;
   bashMode: BashMode;
@@ -194,6 +195,12 @@ function widgetDomainFrom(value: string | undefined): string {
   return parsed.origin;
 }
 
+function instanceContextFrom(value: string | undefined): string | undefined {
+  const normalized = value?.replace(/\s+/g, " ").trim();
+  if (!normalized) return undefined;
+  return normalized.slice(0, 500);
+}
+
 function boolFrom(value: string | undefined, fallback = false): boolean {
   if (value === undefined) return fallback;
   return ["1", "true", "yes", "y", "on"].includes(value.toLowerCase());
@@ -260,6 +267,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     host,
     port: numberFrom(portArg ?? process.env.PORT ?? process.env.CODEXPRO_PORT, 8787, 1, 65535),
     widgetDomain: widgetDomainFrom(widgetDomainArg ?? process.env.CODEXPRO_WIDGET_DOMAIN),
+    instanceContext: instanceContextFrom(process.env.CODEXPRO_INSTANCE_CONTEXT),
     authToken,
     requireHttpToken,
     bashMode: bashModeFrom(bashArg ?? process.env.CODEXPRO_BASH_MODE),
