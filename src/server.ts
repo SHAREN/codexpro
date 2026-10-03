@@ -22,6 +22,7 @@ import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges }
 import { pathRedactions, redactPathsDeep, redactPathsInText } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
 import { requestCorrelationSnapshot } from "./requestContext.js";
+import { recordTelemetry } from "./telemetry.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -203,40 +204,86 @@ function toolCallHeartbeatMs(): number {
   return Math.max(5_000, Math.min(60_000, Math.floor(value)));
 }
 
+function toolCallObservabilityEnabled(): boolean {
+  return toolCallLoggingEnabled() || process.env.CODEXPRO_TELEMETRY !== "0";
+}
+
 function toolCallCorrelation(): Record<string, unknown> | undefined {
   return requestCorrelationSnapshot();
 }
 
+function telemetryCorrelationFields(correlation: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (!correlation) return {};
+  const clientCorrelation = correlation.clientCorrelation && typeof correlation.clientCorrelation === "object"
+    ? correlation.clientCorrelation as Record<string, unknown>
+    : undefined;
+  const fingerprint = typeof clientCorrelation?.["x-openai-session-fingerprint"] === "string"
+    ? clientCorrelation["x-openai-session-fingerprint"]
+    : undefined;
+  return {
+    ...(typeof correlation.requestId === "string" ? { requestId: correlation.requestId } : {}),
+    ...(typeof correlation.mcpSessionId === "string" ? { mcpSessionId: correlation.mcpSessionId } : {}),
+    ...(typeof correlation.jsonRpcId === "string" || typeof correlation.jsonRpcId === "number" || correlation.jsonRpcId === null
+      ? { jsonRpcId: correlation.jsonRpcId }
+      : {}),
+    ...(typeof correlation.jsonRpcMethod === "string" ? { jsonRpcMethod: correlation.jsonRpcMethod } : {}),
+    ...(typeof correlation.requestedTool === "string" ? { requestedTool: correlation.requestedTool } : {}),
+    ...(fingerprint ? { clientSessionFingerprint: fingerprint } : {})
+  };
+}
+
 function logToolCallStart(callId: number, name: string, started: number, args: unknown): void {
-  if (!toolCallLoggingEnabled()) return;
+  if (!toolCallObservabilityEnabled()) return;
   const correlation = toolCallCorrelation();
-  console.error(
-    `[CodexProTool] ${JSON.stringify({
-      ts: new Date(started).toISOString(),
-      event: "start",
-      callId,
-      tool: name,
-      ...(correlation ? { correlation } : {}),
-      args: toolCallLogArgs(args)
-    })}`
-  );
+  const safeArgs = toolCallLogArgs(args);
+  const payload = {
+    ts: new Date(started).toISOString(),
+    event: "start",
+    callId,
+    tool: name,
+    ...(correlation ? { correlation } : {}),
+    args: safeArgs
+  };
+  recordTelemetry({
+    kind: "tool",
+    ts: payload.ts,
+    event: payload.event,
+    callId,
+    tool: name,
+    ...telemetryCorrelationFields(correlation),
+    args: safeArgs
+  });
+  if (toolCallLoggingEnabled()) {
+    console.error(`[CodexProTool] ${JSON.stringify(payload)}`);
+  }
 }
 
 function logToolCallHeartbeat(callId: number, name: string, started: number): void {
-  if (!toolCallLoggingEnabled()) return;
+  if (!toolCallObservabilityEnabled()) return;
   const now = Date.now();
   const correlation = toolCallCorrelation();
-  console.error(
-    `[CodexProTool] ${JSON.stringify({
-      ts: new Date(now).toISOString(),
-      event: "heartbeat",
-      callId,
-      tool: name,
-      state: "tool_running",
-      elapsedMs: now - started,
-      ...(correlation ? { correlation } : {})
-    })}`
-  );
+  const payload = {
+    ts: new Date(now).toISOString(),
+    event: "heartbeat",
+    callId,
+    tool: name,
+    state: "tool_running",
+    elapsedMs: now - started,
+    ...(correlation ? { correlation } : {})
+  };
+  recordTelemetry({
+    kind: "tool",
+    ts: payload.ts,
+    event: payload.event,
+    callId,
+    tool: name,
+    state: payload.state,
+    elapsedMs: payload.elapsedMs,
+    ...telemetryCorrelationFields(correlation)
+  });
+  if (toolCallLoggingEnabled()) {
+    console.error(`[CodexProTool] ${JSON.stringify(payload)}`);
+  }
 }
 
 function toolCallResultSummary(name: string, result: any): Record<string, unknown> | undefined {
@@ -259,22 +306,36 @@ function toolCallResultSummary(name: string, result: any): Record<string, unknow
 }
 
 function logToolCallFinish(callId: number, name: string, status: "ok" | "error", started: number, result?: any): void {
-  if (!toolCallLoggingEnabled()) return;
+  if (!toolCallObservabilityEnabled()) return;
   const finished = Date.now();
   const summary = toolCallResultSummary(name, result);
   const correlation = toolCallCorrelation();
-  console.error(
-    `[CodexProTool] ${JSON.stringify({
-      ts: new Date(finished).toISOString(),
-      event: "finish",
-      callId,
-      tool: name,
-      status,
-      durationMs: finished - started,
-      ...(correlation ? { correlation } : {}),
-      ...(summary ? { result: summary } : {})
-    })}`
-  );
+  const exitCode = name === "bash" && typeof summary?.exitCode === "number" ? summary.exitCode : null;
+  const effectiveStatus: "ok" | "error" = status === "error" || (exitCode !== null && exitCode !== 0) ? "error" : "ok";
+  const payload = {
+    ts: new Date(finished).toISOString(),
+    event: "finish",
+    callId,
+    tool: name,
+    status: effectiveStatus,
+    durationMs: finished - started,
+    ...(correlation ? { correlation } : {}),
+    ...(summary ? { result: summary } : {})
+  };
+  recordTelemetry({
+    kind: "tool",
+    ts: payload.ts,
+    event: payload.event,
+    callId,
+    tool: name,
+    status: effectiveStatus,
+    durationMs: payload.durationMs,
+    ...telemetryCorrelationFields(correlation),
+    ...(summary ? { result: summary } : {})
+  });
+  if (toolCallLoggingEnabled()) {
+    console.error(`[CodexProTool] ${JSON.stringify(payload)}`);
+  }
 }
 
 function registerToolCardResource(server: McpServer, config: CodexProConfig): void {
@@ -394,7 +455,7 @@ function registerToolCompat(
     const started = Date.now();
     const callId = ++toolCallSequence;
     logToolCallStart(callId, name, started, args ?? {});
-    const heartbeat = toolCallLoggingEnabled()
+    const heartbeat = toolCallObservabilityEnabled()
       ? setInterval(() => logToolCallHeartbeat(callId, name, started), toolCallHeartbeatMs())
       : undefined;
     heartbeat?.unref?.();

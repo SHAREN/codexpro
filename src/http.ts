@@ -22,6 +22,7 @@ import { WorkspaceRegistry } from "./guard.js";
 import { redactConfigPaths } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
 import { runWithMcpRequestContext, type McpRequestContext } from "./requestContext.js";
+import { recordTelemetry, telemetrySnapshot } from "./telemetry.js";
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -1636,7 +1637,7 @@ async function main(): Promise<void> {
   }
 
   function correlationFingerprint(value: string): string {
-    return createHash("sha256").update(value).digest("hex").slice(0, 16);
+    return createHash("sha256").update(value).digest("hex").slice(0, 12);
   }
 
   function clientCorrelationHeaders(req: Request): Record<string, string> {
@@ -1695,10 +1696,15 @@ async function main(): Promise<void> {
     return undefined;
   }
 
+  function telemetryEnabled(): boolean {
+    return process.env.CODEXPRO_TELEMETRY !== "0";
+  }
+
   function logMcpRequest(event: "start" | "finish" | "error", context: McpRequestContext, extra: Record<string, unknown> = {}): void {
-    if (!logRequests) return;
-    console.error("[CodexProRequest] " + JSON.stringify({
-      ts: new Date().toISOString(),
+    if (!logRequests && !telemetryEnabled()) return;
+    const ts = new Date().toISOString();
+    const payload = {
+      ts,
       event,
       requestId: context.requestId,
       ...(context.mcpSessionId ? { mcpSessionId: context.mcpSessionId } : {}),
@@ -1709,7 +1715,27 @@ async function main(): Promise<void> {
         ? { clientCorrelation: context.clientCorrelation }
         : {}),
       ...extra
-    }));
+    };
+    if (telemetryEnabled()) {
+      recordTelemetry({
+        kind: "request",
+        ts,
+        event,
+        requestId: context.requestId,
+        ...(context.mcpSessionId ? { mcpSessionId: context.mcpSessionId } : {}),
+        ...(context.jsonRpcId !== undefined ? { jsonRpcId: context.jsonRpcId } : {}),
+        ...(context.jsonRpcMethod ? { jsonRpcMethod: context.jsonRpcMethod } : {}),
+        ...(context.requestedTool ? { requestedTool: context.requestedTool } : {}),
+        ...(clientSessionFingerprint(context) ? { clientSessionFingerprint: clientSessionFingerprint(context) } : {}),
+        ...(typeof extra.httpMethod === "string" ? { httpMethod: extra.httpMethod } : {}),
+        ...(typeof extra.path === "string" ? { path: extra.path } : {}),
+        ...(typeof extra.statusCode === "number" ? { statusCode: extra.statusCode } : {}),
+        ...(typeof extra.durationMs === "number" ? { durationMs: extra.durationMs } : {})
+      });
+    }
+    if (logRequests) {
+      console.error("[CodexProRequest] " + JSON.stringify(payload));
+    }
   }
 
   function sendSessionError(res: Response, sessionId: string | undefined): void {
@@ -1767,7 +1793,7 @@ async function main(): Promise<void> {
     ? Math.max(10_000, Math.min(120_000, Math.floor(configuredSessionHeartbeatMs)))
     : 30_000;
   const sessionHeartbeatWindowMs = Math.min(config.httpSessionTtlMs, 5 * 60_000);
-  const sessionHeartbeatTimer = logRequests
+  const sessionHeartbeatTimer = (logRequests || telemetryEnabled())
     ? setInterval(() => {
         const now = Date.now();
         const grouped = new Map<string, {
@@ -1818,13 +1844,15 @@ async function main(): Promise<void> {
         for (const record of grouped.values()) {
           const sinceLastRequestSeenMs = now - record.lastSeenAt;
           const requestActive = record.activeRequests > 0;
-          console.error("[CodexProSession] " + JSON.stringify({
-            ts: new Date(now).toISOString(),
+          const ts = new Date(now).toISOString();
+          const state = requestActive ? "request_active" : "idle_between_requests";
+          const payload = {
+            ts,
             event: "heartbeat",
             ...(record.clientSessionFingerprint ? { clientSessionFingerprint: record.clientSessionFingerprint } : {}),
             latestMcpSessionId: record.latestMcpSessionId,
             transportCount: record.transportCount,
-            state: requestActive ? "request_active" : "idle_between_requests",
+            state,
             activeRequests: record.activeRequests,
             ageMs: now - record.createdAt,
             ...(requestActive
@@ -1833,7 +1861,28 @@ async function main(): Promise<void> {
             ...(record.lastRequestId ? { lastRequestId: record.lastRequestId } : {}),
             ...(record.lastRequestedTool ? { lastRequestedTool: record.lastRequestedTool } : {}),
             ...(record.lastJsonRpcMethod ? { lastJsonRpcMethod: record.lastJsonRpcMethod } : {})
-          }));
+          };
+          if (telemetryEnabled()) {
+            recordTelemetry({
+              kind: "session",
+              ts,
+              event: "heartbeat",
+              ...(record.clientSessionFingerprint ? { clientSessionFingerprint: record.clientSessionFingerprint } : {}),
+              mcpSessionId: record.latestMcpSessionId,
+              transportCount: record.transportCount,
+              state,
+              activeRequests: record.activeRequests,
+              ...(requestActive
+                ? { requestActiveForAtLeastMs: sinceLastRequestSeenMs }
+                : { idleForMs: sinceLastRequestSeenMs }),
+              ...(record.lastRequestId ? { requestId: record.lastRequestId } : {}),
+              ...(record.lastRequestedTool ? { requestedTool: record.lastRequestedTool } : {}),
+              ...(record.lastJsonRpcMethod ? { jsonRpcMethod: record.lastJsonRpcMethod } : {})
+            });
+          }
+          if (logRequests) {
+            console.error("[CodexProSession] " + JSON.stringify(payload));
+          }
         }
       }, sessionHeartbeatMs)
     : undefined;
@@ -1866,6 +1915,34 @@ async function main(): Promise<void> {
       authRequired: Boolean(config.authToken),
       connection_diagnostics: connectionDiagnostics
     }, { labelUnknownPaths: true }));
+  });
+
+  app.get("/telemetry/recent", (req, res) => {
+    const parseIntParam = (value: unknown, fallback: number, min: number, max: number): number => {
+      const raw = Array.isArray(value) ? value[0] : value;
+      const parsed = typeof raw === "string" && raw.trim() !== "" ? Number(raw) : fallback;
+      if (!Number.isFinite(parsed)) return fallback;
+      return Math.max(min, Math.min(max, Math.floor(parsed)));
+    };
+    const sinceSeq = parseIntParam(req.query.since_seq, 0, 0, Number.MAX_SAFE_INTEGER);
+    const limit = parseIntParam(req.query.limit, 200, 1, 2_000);
+    const rawFingerprint = Array.isArray(req.query.client_session) ? req.query.client_session[0] : req.query.client_session;
+    const clientSessionFingerprint = typeof rawFingerprint === "string" ? rawFingerprint.trim() : "";
+    if (clientSessionFingerprint && !/^[a-f0-9]{8,64}$/i.test(clientSessionFingerprint)) {
+      jsonError(res, 400, "invalid_client_session", "client_session must be a hexadecimal session fingerprint.");
+      return;
+    }
+    res.json({
+      ok: true,
+      name: "CodexPro",
+      version: CODEXPRO_VERSION,
+      generatedAt: new Date().toISOString(),
+      ...telemetrySnapshot({
+        sinceSeq,
+        limit,
+        ...(clientSessionFingerprint ? { clientSessionFingerprint } : {})
+      })
+    });
   });
 
   app.get("/admin/profile", (_req, res) => {
