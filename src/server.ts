@@ -21,6 +21,7 @@ import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { pathRedactions, redactPathsDeep, redactPathsInText } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
+import { requestCorrelationSnapshot } from "./requestContext.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -178,9 +179,102 @@ function toolCallLoggingEnabled(): boolean {
   return process.env.CODEXPRO_LOG_TOOL_CALLS === "1" || process.env.CODEXPRO_LOG_REQUESTS === "1";
 }
 
-function logToolCall(name: string, status: "ok" | "error", started: number): void {
+const TOOL_CALL_LOG_MAX_CHARS = 8_000;
+let toolCallSequence = 0;
+
+function toolCallLogArgs(args: unknown): unknown {
+  const safe = redactStructured(compactStructuredContent(args));
+  try {
+    const json = JSON.stringify(safe);
+    if (json.length <= TOOL_CALL_LOG_MAX_CHARS) return safe;
+    return {
+      truncated: true,
+      preview: redactSensitiveText(json.slice(0, TOOL_CALL_LOG_MAX_CHARS)),
+      originalChars: json.length
+    };
+  } catch {
+    return { unserializable: true };
+  }
+}
+
+function toolCallHeartbeatMs(): number {
+  const value = Number(process.env.CODEXPRO_TOOL_HEARTBEAT_MS ?? 15_000);
+  if (!Number.isFinite(value)) return 15_000;
+  return Math.max(5_000, Math.min(60_000, Math.floor(value)));
+}
+
+function toolCallCorrelation(): Record<string, unknown> | undefined {
+  return requestCorrelationSnapshot();
+}
+
+function logToolCallStart(callId: number, name: string, started: number, args: unknown): void {
   if (!toolCallLoggingEnabled()) return;
-  console.error(`[CodexProTool] ${name} ${status} ${Date.now() - started}ms`);
+  const correlation = toolCallCorrelation();
+  console.error(
+    `[CodexProTool] ${JSON.stringify({
+      ts: new Date(started).toISOString(),
+      event: "start",
+      callId,
+      tool: name,
+      ...(correlation ? { correlation } : {}),
+      args: toolCallLogArgs(args)
+    })}`
+  );
+}
+
+function logToolCallHeartbeat(callId: number, name: string, started: number): void {
+  if (!toolCallLoggingEnabled()) return;
+  const now = Date.now();
+  const correlation = toolCallCorrelation();
+  console.error(
+    `[CodexProTool] ${JSON.stringify({
+      ts: new Date(now).toISOString(),
+      event: "heartbeat",
+      callId,
+      tool: name,
+      state: "tool_running",
+      elapsedMs: now - started,
+      ...(correlation ? { correlation } : {})
+    })}`
+  );
+}
+
+function toolCallResultSummary(name: string, result: any): Record<string, unknown> | undefined {
+  const structured = result?.structuredContent;
+  if (name === "bash" && structured && typeof structured === "object") {
+    return {
+      exitCode: structured.exitCode ?? null,
+      signal: structured.signal ?? null,
+      truncated: Boolean(structured.truncated),
+      stdoutChars: typeof structured.stdout === "string" ? structured.stdout.length : 0,
+      stderrChars: typeof structured.stderr === "string" ? structured.stderr.length : 0
+    };
+  }
+  if (result?.isError) {
+    return {
+      error: typeof structured?.error === "string" ? redactSensitiveText(structured.error) : "tool_error"
+    };
+  }
+  return undefined;
+}
+
+function logToolCallFinish(callId: number, name: string, status: "ok" | "error", started: number, result?: any): void {
+  if (!toolCallLoggingEnabled()) return;
+  const finished = Date.now();
+  const summary = toolCallResultSummary(name, result);
+  const correlation = toolCallCorrelation();
+  console.error(
+    `[CodexProTool] ${JSON.stringify({
+      ts: new Date(finished).toISOString(),
+      event: "finish",
+      callId,
+      tool: name,
+      status,
+      durationMs: finished - started,
+      ...(correlation ? { correlation } : {}),
+      ...(summary ? { result: summary } : {})
+    })}`
+  );
 }
 
 function registerToolCardResource(server: McpServer, config: CodexProConfig): void {
@@ -298,14 +392,22 @@ function registerToolCompat(
 ): void {
   const wrapped = async (args: any) => {
     const started = Date.now();
+    const callId = ++toolCallSequence;
+    logToolCallStart(callId, name, started, args ?? {});
+    const heartbeat = toolCallLoggingEnabled()
+      ? setInterval(() => logToolCallHeartbeat(callId, name, started), toolCallHeartbeatMs())
+      : undefined;
+    heartbeat?.unref?.();
     try {
       const result = tagToolResult(await handler(args ?? {}), name, options, config);
-      logToolCall(name, result?.isError ? "error" : "ok", started);
+      logToolCallFinish(callId, name, result?.isError ? "error" : "ok", started, result);
       return result;
     } catch (error) {
       const result = tagToolResult(errorResult(error), name, options, config);
-      logToolCall(name, "error", started);
+      logToolCallFinish(callId, name, "error", started, result);
       return result;
+    } finally {
+      if (heartbeat) clearInterval(heartbeat);
     }
   };
 
