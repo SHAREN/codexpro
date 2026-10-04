@@ -1,12 +1,16 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DEFAULT_ANALYSIS_LIMITS, type AnalysisLimits } from "./analysis/types.js";
 
 export type BashMode = "off" | "safe" | "full";
 export type BashTranscriptMode = "compact" | "full";
+export type BashRuntime = "auto" | "native-bash" | "wsl";
 export type CodexSessionsMode = "off" | "metadata" | "read";
 export type WriteMode = "off" | "handoff" | "workspace";
 export type ToolMode = "minimal" | "standard" | "full";
+export const MIN_HTTP_TOKEN_BYTES = 24;
+export const MAX_BASH_TIMEOUT_MS = 900_000;
 
 export interface CodexProConfig {
   defaultRoot: string;
@@ -19,21 +23,31 @@ export interface CodexProConfig {
   requireHttpToken: boolean;
   bashMode: BashMode;
   bashTranscript: BashTranscriptMode;
+  bashRuntime: BashRuntime;
+  bashExecutable?: string;
+  gitExecutable?: string;
   bashSessionId?: string;
   requireBashSession: boolean;
   codexSessions: CodexSessionsMode;
   codexDir: string;
   writeMode: WriteMode;
   toolMode: ToolMode;
+  exposeAbsolutePaths: boolean;
   inheritEnv: boolean;
   maxReadBytes: number;
   maxWriteBytes: number;
   maxOutputBytes: number;
+  maxBashTimeoutMs: number;
+  maxImportBytes: number;
   maxSearchResults: number;
   maxHttpSessions: number;
   httpSessionTtlMs: number;
   blockedGlobs: string[];
   contextDir: string;
+  toolCards: boolean;
+  connectionTest: boolean;
+  analysisEnabled: boolean;
+  analysisLimits: AnalysisLimits;
 }
 
 const DEFAULT_BLOCKED_GLOBS = [
@@ -44,9 +58,13 @@ const DEFAULT_BLOCKED_GLOBS = [
   "node_modules/**",
   "**/node_modules/**",
   ".env",
+  ".env/**",
   ".env.*",
+  ".env.*/**",
   "**/.env",
+  "**/.env/**",
   "**/.env.*",
+  "**/.env.*/**",
   "**/*.pem",
   "**/*.key",
   "**/id_rsa",
@@ -134,7 +152,7 @@ function toRealDir(input: string): string {
   if (!stat.isDirectory()) {
     throw new Error(`Not a directory: ${resolved}`);
   }
-  return fs.realpathSync(resolved);
+  return fs.realpathSync.native(resolved);
 }
 
 function numberFrom(value: string | undefined, fallback: number, min: number, max: number): number {
@@ -151,6 +169,16 @@ function bashModeFrom(value: string | undefined): BashMode {
 function bashTranscriptFrom(value: string | undefined): BashTranscriptMode {
   if (value === "compact" || value === "full") return value;
   return "compact";
+}
+
+function bashRuntimeFrom(value: string | undefined): BashRuntime {
+  if (value === "auto" || value === "native-bash" || value === "wsl") return value;
+  return "auto";
+}
+
+function bashExecutableFrom(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
 }
 
 function codexSessionsFrom(value: string | undefined): CodexSessionsMode {
@@ -201,6 +229,32 @@ function instanceContextFrom(value: string | undefined): string | undefined {
   return normalized.slice(0, 500);
 }
 
+function contextDirFrom(value: string | undefined): string {
+  const raw = (value?.trim() || ".ai-bridge").replaceAll("\\", "/");
+  if (path.isAbsolute(raw) || path.win32.isAbsolute(raw)) {
+    throw new Error("CODEXPRO_CONTEXT_DIR must be a workspace-relative hidden directory, for example .ai-bridge.");
+  }
+
+  const normalized = path.posix.normalize(raw);
+  if (!normalized || normalized === "." || normalized === ".." || normalized.startsWith("../")) {
+    throw new Error("CODEXPRO_CONTEXT_DIR must stay inside the workspace.");
+  }
+
+  const parts = normalized.split("/");
+  if (parts.some((part) => !part || part === "." || part === "..")) {
+    throw new Error("CODEXPRO_CONTEXT_DIR must be a simple relative directory path.");
+  }
+  if (!parts[0].startsWith(".")) {
+    throw new Error("CODEXPRO_CONTEXT_DIR must start with a hidden directory such as .ai-bridge.");
+  }
+
+  const blocked = new Set([".git", ".ssh", ".gnupg", ".cache", "node_modules", "src", "dist", "build", ".next", "coverage"]);
+  if (parts.some((part) => blocked.has(part))) {
+    throw new Error("CODEXPRO_CONTEXT_DIR cannot point at source, dependency, build, cache, or credential directories.");
+  }
+  return normalized;
+}
+
 function boolFrom(value: string | undefined, fallback = false): boolean {
   if (value === undefined) return fallback;
   return ["1", "true", "yes", "y", "on"].includes(value.toLowerCase());
@@ -235,6 +289,9 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
   const hostArg = typeof args.host === "string" ? args.host : undefined;
   const bashArg = typeof args.bash === "string" ? args.bash : undefined;
   const bashTranscriptArg = typeof args["bash-transcript"] === "string" ? args["bash-transcript"] : undefined;
+  const bashRuntimeArg = typeof args["bash-runtime"] === "string" ? args["bash-runtime"] : undefined;
+  const bashExecutableArg = typeof args["bash-executable"] === "string" ? args["bash-executable"] : undefined;
+  const gitExecutableArg = typeof args["git-executable"] === "string" ? args["git-executable"] : undefined;
   const bashSessionArg = typeof args["bash-session"] === "string" ? args["bash-session"] : undefined;
   const codexSessionsArg = typeof args["codex-sessions"] === "string" ? args["codex-sessions"] : undefined;
   const codexDirArg = typeof args["codex-dir"] === "string" ? args["codex-dir"] : undefined;
@@ -247,11 +304,24 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
   const writeArg = typeof args.write === "string" ? args.write : undefined;
   const toolModeArg = typeof args["tool-mode"] === "string" ? args["tool-mode"] : undefined;
   const widgetDomainArg = typeof args["widget-domain"] === "string" ? args["widget-domain"] : undefined;
+  const toolCardsArg =
+    args["tool-cards"] === true
+      ? "true"
+      : typeof args["tool-cards"] === "string"
+        ? args["tool-cards"]
+        : undefined;
   const extraBlockedGlobs = splitList(process.env.CODEXPRO_BLOCKED_GLOBS, ",");
-  const host = hostArg ?? process.env.HOST ?? process.env.CODEXPRO_HOST ?? "127.0.0.1";
+  const host = hostArg ?? process.env.CODEXPRO_HOST ?? process.env.HOST ?? "127.0.0.1";
   const authToken = process.env.CODEXPRO_HTTP_TOKEN ?? process.env.CODEBASE_BRIDGE_HTTP_TOKEN;
-  const allowNoToken = boolFrom(process.env.CODEXPRO_ALLOW_NO_HTTP_TOKEN, false);
+  if (authToken && Buffer.byteLength(authToken, "utf8") < MIN_HTTP_TOKEN_BYTES) {
+    throw new Error(
+      `CODEXPRO_HTTP_TOKEN must be at least ${MIN_HTTP_TOKEN_BYTES} bytes. ` +
+      "Use `codexpro start` to generate a strong token."
+    );
+  }
+  const allowNoToken = boolFrom(process.env.CODEXPRO_ALLOW_NO_HTTP_TOKEN, false) && isLoopbackHost(host);
   const requireHttpToken =
+    (!authToken && !allowNoToken) ||
     boolFrom(process.env.CODEXPRO_REQUIRE_HTTP_TOKEN, false) ||
     boolFrom(process.env.CODEXPRO_TUNNEL_MODE, false) ||
     (!isLoopbackHost(host) && !allowNoToken);
@@ -265,27 +335,44 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     defaultRoot,
     allowedRoots,
     host,
-    port: numberFrom(portArg ?? process.env.PORT ?? process.env.CODEXPRO_PORT, 8787, 1, 65535),
+    port: numberFrom(portArg ?? process.env.CODEXPRO_PORT ?? process.env.PORT, 8787, 1, 65535),
     widgetDomain: widgetDomainFrom(widgetDomainArg ?? process.env.CODEXPRO_WIDGET_DOMAIN),
     instanceContext: instanceContextFrom(process.env.CODEXPRO_INSTANCE_CONTEXT),
     authToken,
     requireHttpToken,
     bashMode: bashModeFrom(bashArg ?? process.env.CODEXPRO_BASH_MODE),
     bashTranscript: bashTranscriptFrom(bashTranscriptArg ?? process.env.CODEXPRO_BASH_TRANSCRIPT),
+    bashRuntime: bashRuntimeFrom(bashRuntimeArg ?? process.env.CODEXPRO_BASH_RUNTIME),
+    bashExecutable: bashExecutableFrom(bashExecutableArg ?? process.env.CODEXPRO_BASH_EXECUTABLE),
+    gitExecutable: bashExecutableFrom(gitExecutableArg ?? process.env.CODEXPRO_GIT_EXECUTABLE),
     bashSessionId,
     requireBashSession,
     codexSessions: codexSessionsFrom(codexSessionsArg ?? process.env.CODEXPRO_CODEX_SESSIONS),
     codexDir: expandHome(codexDirArg || process.env.CODEXPRO_CODEX_DIR || path.join(os.homedir(), ".codex")),
     writeMode: writeModeFrom(writeArg ?? process.env.CODEXPRO_WRITE_MODE),
     toolMode: toolModeFrom(toolModeArg ?? process.env.CODEXPRO_TOOL_MODE),
+    exposeAbsolutePaths: boolFrom(process.env.CODEXPRO_EXPOSE_ABSOLUTE_PATHS, false),
     inheritEnv: process.env.CODEXPRO_INHERIT_ENV === "1",
     maxReadBytes: numberFrom(process.env.CODEXPRO_MAX_READ_BYTES, 180_000, 4_000, 2_000_000),
     maxWriteBytes: numberFrom(process.env.CODEXPRO_MAX_WRITE_BYTES, 1_000_000, 1_000, 10_000_000),
     maxOutputBytes: numberFrom(process.env.CODEXPRO_MAX_OUTPUT_BYTES, 120_000, 4_000, 2_000_000),
+    // Default hard cap is 10 minutes. Operators can raise up to 15 minutes.
+    maxBashTimeoutMs: numberFrom(process.env.CODEXPRO_MAX_BASH_TIMEOUT_MS, 600_000, 1_000, MAX_BASH_TIMEOUT_MS),
+    maxImportBytes: numberFrom(process.env.CODEXPRO_MAX_IMPORT_BYTES, 5_000_000, 1_000, 50_000_000),
     maxSearchResults: numberFrom(process.env.CODEXPRO_MAX_SEARCH_RESULTS, 200, 5, 2_000),
     maxHttpSessions: numberFrom(process.env.CODEXPRO_MAX_HTTP_SESSIONS, 64, 1, 512),
     httpSessionTtlMs: numberFrom(process.env.CODEXPRO_HTTP_SESSION_TTL_MS, 30 * 60_000, 60_000, 24 * 60 * 60_000),
     blockedGlobs: [...DEFAULT_BLOCKED_GLOBS, ...extraBlockedGlobs],
-    contextDir: process.env.CODEXPRO_CONTEXT_DIR ?? ".ai-bridge"
+    contextDir: contextDirFrom(process.env.CODEXPRO_CONTEXT_DIR),
+    toolCards: boolFrom(toolCardsArg ?? process.env.CODEXPRO_TOOL_CARDS, false),
+    connectionTest: boolFrom(process.env.CODEXPRO_CONNECTION_TEST, false),
+    analysisEnabled: boolFrom(process.env.CODEXPRO_ANALYSIS, true),
+    analysisLimits: {
+      maxInventoryFiles: numberFrom(process.env.CODEXPRO_ANALYSIS_MAX_INVENTORY_FILES, DEFAULT_ANALYSIS_LIMITS.maxInventoryFiles, 100, 100_000),
+      maxAnalyzedFiles: numberFrom(process.env.CODEXPRO_ANALYSIS_MAX_ANALYZED_FILES, DEFAULT_ANALYSIS_LIMITS.maxAnalyzedFiles, 10, 50_000),
+      maxScannedBytes: numberFrom(process.env.CODEXPRO_ANALYSIS_MAX_SCANNED_BYTES, DEFAULT_ANALYSIS_LIMITS.maxScannedBytes, 1_000_000, 512 * 1024 * 1024),
+      maxSymbols: numberFrom(process.env.CODEXPRO_ANALYSIS_MAX_SYMBOLS, DEFAULT_ANALYSIS_LIMITS.maxSymbols, 100, 1_000_000),
+      maxRelationships: numberFrom(process.env.CODEXPRO_ANALYSIS_MAX_RELATIONSHIPS, DEFAULT_ANALYSIS_LIMITS.maxRelationships, 100, 2_000_000)
+    }
   };
 }
