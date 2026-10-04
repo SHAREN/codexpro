@@ -22,6 +22,7 @@ import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges }
 import { pathRedactions, redactPathsDeep, redactPathsInText } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
 import { requestCorrelationSnapshot } from "./requestContext.js";
+import { bindingMarkerFromCorrelation } from "./bindingMarker.js";
 import { recordTelemetry } from "./telemetry.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
@@ -128,10 +129,12 @@ function tagToolResult(result: any, name: string, options: Record<string, unknow
     structured && typeof structured === "object" && !Array.isArray(structured)
       ? structured
       : {};
+  const marker = bindingMarkerFromCorrelation(requestCorrelationSnapshot());
   const tagged = {
     codexpro_tool: name,
     codexpro_title: options.title ?? name,
-    ...base
+    ...base,
+    ...(marker ? { codexpro_binding_marker: marker } : {})
   };
   const meta = (options._meta as Record<string, unknown> | undefined) ?? {};
   result.structuredContent = meta.ui || meta["openai/outputTemplate"] ? compactStructuredContent(tagged) : tagged;
