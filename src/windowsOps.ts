@@ -182,9 +182,10 @@ function normalizeService(value: WindowsServiceName | undefined): WindowsService
 
 function serviceState(output: string): "running" | "stopped" | "pending" | "unknown" {
   const normalized = output.toUpperCase();
-  if (/STATE\s*:\s*4\s+RUNNING/.test(normalized)) return "running";
-  if (/STATE\s*:\s*1\s+STOPPED/.test(normalized)) return "stopped";
-  if (/STATE\s*:\s*[23567]\s+/.test(normalized)) return "pending";
+  // sc.exe localizes field labels, but the numeric state and state token remain stable.
+  if (/:\s*4\s+RUNNING\b/.test(normalized)) return "running";
+  if (/:\s*1\s+STOPPED\b/.test(normalized)) return "stopped";
+  if (/:\s*(?:2|3|5|6|7)\s+/.test(normalized)) return "pending";
   return "unknown";
 }
 
