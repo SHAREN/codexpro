@@ -13,6 +13,7 @@ export const WINDOWS_CONTROL_ACTIONS = [
   "wsl_status",
   "wsl_list",
   "wsl_shutdown",
+  "wsl_recover",
   "wsl_terminate",
   "service_status",
   "service_restart",
@@ -229,6 +230,94 @@ async function restartService(service: WindowsServiceName, timeoutMs: number): P
   return { ok: running, commands };
 }
 
+async function serviceProcessId(
+  service: WindowsServiceName,
+  timeoutMs: number,
+  commands: WindowsNativeCommandResult[]
+): Promise<number | undefined> {
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)`,
+    `$s = Get-CimInstance Win32_Service -Filter \"Name='${service}'\"`,
+    "if (-not $s) { exit 3 }",
+    "[pscustomobject]@{ Name=$s.Name; State=$s.State; ProcessId=[int]$s.ProcessId } | ConvertTo-Json -Compress"
+  ].join("; ");
+  const result = await runNative(
+    powershellExecutable(),
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+    Math.min(5_000, timeoutMs)
+  );
+  commands.push(result);
+  if (!result.ok || !result.stdout) return undefined;
+  try {
+    const parsed = JSON.parse(result.stdout) as { ProcessId?: number };
+    const pid = Number(parsed.ProcessId);
+    return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function recoverWsl(timeoutMs: number): Promise<{
+  ok: boolean;
+  forcedServiceKill: boolean;
+  servicePid?: number;
+  commands: WindowsNativeCommandResult[];
+}> {
+  const commands: WindowsNativeCommandResult[] = [];
+  const wsl = system32Executable("wsl.exe");
+  const sc = system32Executable("sc.exe");
+  const taskkill = system32Executable("taskkill.exe");
+  let forcedServiceKill = false;
+  let servicePid: number | undefined;
+
+  // Best-effort graceful shutdown. A hung WSL is expected to time out here; recovery must continue.
+  commands.push(await runNative(wsl, ["--shutdown"], Math.min(5_000, timeoutMs)));
+
+  let query = await runNative(sc, ["query", "WslService"], Math.min(4_000, timeoutMs));
+  commands.push(query);
+  if (!query.ok) return { ok: false, forcedServiceKill, commands };
+
+  if (serviceState(query.stdout) !== "stopped") {
+    const stop = await runNative(sc, ["stop", "WslService"], Math.min(5_000, timeoutMs));
+    commands.push(stop);
+    const stopped = await waitForServiceState("WslService", "stopped", Math.min(5_000, timeoutMs), commands);
+    if (!stopped) {
+      servicePid = await serviceProcessId("WslService", timeoutMs, commands);
+      if (!servicePid) return { ok: false, forcedServiceKill, commands };
+      const killed = await runNative(taskkill, ["/PID", String(servicePid), "/F"], Math.min(5_000, timeoutMs));
+      commands.push(killed);
+      if (!killed.ok) return { ok: false, forcedServiceKill, servicePid, commands };
+      forcedServiceKill = true;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
+  query = await runNative(sc, ["query", "WslService"], Math.min(4_000, timeoutMs));
+  commands.push(query);
+  let state = query.ok ? serviceState(query.stdout) : "unknown";
+  if (state !== "running") {
+    if (state !== "stopped") {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      query = await runNative(sc, ["query", "WslService"], Math.min(4_000, timeoutMs));
+      commands.push(query);
+      state = query.ok ? serviceState(query.stdout) : "unknown";
+    }
+    if (state === "stopped") {
+      const start = await runNative(sc, ["start", "WslService"], Math.min(5_000, timeoutMs));
+      commands.push(start);
+      if (!start.ok) return { ok: false, forcedServiceKill, servicePid, commands };
+    }
+    if (!(await waitForServiceState("WslService", "running", Math.min(8_000, timeoutMs), commands))) {
+      return { ok: false, forcedServiceKill, servicePid, commands };
+    }
+  }
+
+  const status = await runNative(wsl, ["--status"], Math.min(8_000, timeoutMs));
+  commands.push(status);
+  return { ok: status.ok, forcedServiceKill, servicePid, commands };
+}
+
 function eventLogScript(kind: WindowsEventLogKind, limit: number): string {
   if (kind === "hyperv_compute") {
     return `$ErrorActionPreference='Stop'; Get-WinEvent -LogName 'Microsoft-Windows-Hyper-V-Compute-Admin' -MaxEvents ${limit} | Select-Object TimeCreated,Id,LevelDisplayName,ProviderName,Message | ConvertTo-Json -Compress -Depth 3`;
@@ -273,6 +362,17 @@ export async function runWindowsControl(options: WindowsControlOptions): Promise
       const result = await runNative(wsl, ["--shutdown"], timeoutMs);
       commands.push(result);
       ok = result.ok;
+      break;
+    }
+    case "wsl_recover": {
+      changed = true;
+      const recovered = await recoverWsl(timeoutMs);
+      commands.push(...recovered.commands);
+      ok = recovered.ok;
+      data = {
+        forcedServiceKill: recovered.forcedServiceKill,
+        servicePid: recovered.servicePid ?? null
+      };
       break;
     }
     case "wsl_terminate": {

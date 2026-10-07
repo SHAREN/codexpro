@@ -645,7 +645,7 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
     {
       title: "Windows Control",
       description:
-        "Native Windows emergency diagnostics and recovery that does not depend on WSL. Only predefined local actions are accepted; arbitrary PowerShell or shell commands are not supported. Use status/disk_space/wsl_status/wsl_list/service_status/event_log for diagnostics, and wsl_shutdown/wsl_terminate/service_restart only when the user has requested the corresponding system change.",
+        "Native Windows emergency diagnostics and recovery that does not depend on WSL. Only predefined local actions are accepted; arbitrary PowerShell or shell commands are not supported. Use status/disk_space/wsl_status/wsl_list/service_status/event_log for diagnostics, and wsl_shutdown/wsl_recover/wsl_terminate/service_restart only when the user has requested the corresponding system change. wsl_recover may force-terminate only a stuck WslService process after graceful shutdown/stop time out; it does not restart vmcompute or modify WSL disks.",
       inputSchema: {
         action: z.enum(WINDOWS_CONTROL_ACTIONS).describe("Predefined native Windows action."),
         service: z.enum(WINDOWS_SERVICE_NAMES).optional().describe("Required for service_status/service_restart. Restricted to WSL/Host Compute services."),
