@@ -14,6 +14,7 @@ import { codexproInventory, loadSkill } from "./capabilitiesOps.js";
 import { listCodexSessions, readCodexSession } from "./codexSessions.js";
 import { TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
+import { runWindowsControl, WINDOWS_CONTROL_ACTIONS, WINDOWS_EVENT_LOGS, WINDOWS_SERVICE_NAMES } from "./windowsOps.js";
 
 function errorText(error: unknown): string {
   if (error instanceof Error) return redactSensitiveText(`${error.name}: ${error.message}`);
@@ -242,6 +243,7 @@ const FULL_TOOL_NAMES = [
   "codexpro_self_test",
   "codexpro_inventory",
   "load_skill",
+  "windows_control",
   "list_workspaces",
   "open_current_workspace",
   "open_workspace",
@@ -288,6 +290,7 @@ const STANDARD_TOOLS = new Set<string>(STANDARD_TOOL_NAMES);
 function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
   if (name === "codex_sessions") return config.codexSessions !== "off";
   if (name === "read_codex_session") return config.codexSessions === "read";
+  if (name === "windows_control" && process.platform !== "win32") return false;
   if (config.toolMode === "full") return true;
   if (config.toolMode === "minimal") return MINIMAL_TOOLS.has(name);
   return STANDARD_TOOLS.has(name);
@@ -632,6 +635,61 @@ export function createCodexProServer(config: CodexProConfig): McpServer {
         blockedGlobs: config.blockedGlobs
       };
       return textResult(`# CodexPro Server Config\n\n${JSON.stringify(safeConfig, null, 2)}`, safeConfig);
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "windows_control",
+    {
+      title: "Windows Control",
+      description:
+        "Native Windows emergency diagnostics and recovery that does not depend on WSL. Only predefined local actions are accepted; arbitrary PowerShell or shell commands are not supported. Use status/disk_space/wsl_status/wsl_list/service_status/event_log for diagnostics, and wsl_shutdown/wsl_terminate/service_restart only when the user has requested the corresponding system change.",
+      inputSchema: {
+        action: z.enum(WINDOWS_CONTROL_ACTIONS).describe("Predefined native Windows action."),
+        service: z.enum(WINDOWS_SERVICE_NAMES).optional().describe("Required for service_status/service_restart. Restricted to WSL/Host Compute services."),
+        distro: z.string().min(1).max(128).optional().describe("Required for wsl_terminate. Exact WSL distribution name."),
+        event_log: z.enum(WINDOWS_EVENT_LOGS).optional().describe("Event source for event_log. Default: wsl."),
+        limit: z.number().int().min(1).max(100).optional().describe("Maximum event records for event_log. Default: 30."),
+        timeout_ms: z.number().int().min(1000).max(30000).optional().describe("Hard timeout for each native Windows command. Default: 8000 ms.")
+      },
+      annotations: LOCAL_WRITE_ANNOTATIONS,
+      _meta: {
+        ...toolCardMeta(),
+        "openai/toolInvocation/invoking": "Running native Windows control...",
+        "openai/toolInvocation/invoked": "Native Windows control complete"
+      }
+    },
+    async (args) => {
+      const result = await runWindowsControl({
+        action: args.action,
+        service: args.service,
+        distro: args.distro,
+        eventLog: args.event_log,
+        limit: args.limit,
+        timeoutMs: args.timeout_ms
+      });
+      const commandLines = result.commands.length
+        ? result.commands.map((command, index) => {
+            const executable = path.basename(command.executable);
+            const state = command.ok ? "ok" : command.timedOut ? "timeout" : `exit ${command.exitCode ?? "?"}`;
+            return `${index + 1}. ${executable} ${command.args.join(" ")} — ${state}, ${command.durationMs} ms`;
+          })
+        : ["No child process was required."];
+      const text = [
+        "# Windows Control",
+        "",
+        `Action: ${result.action}`,
+        `Result: ${result.ok ? "ok" : "failed"}`,
+        `Changed system state: ${result.changed ? "yes" : "no"}`,
+        `Duration: ${result.durationMs} ms`,
+        "",
+        "## Native commands",
+        "",
+        ...commandLines
+      ].join("\n");
+      return textResult(text, { ...result });
     }
   );
 
