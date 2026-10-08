@@ -2,13 +2,13 @@
 
 ## 我应该用什么 ChatGPT 账号？
 
-使用 ChatGPT Plus 或 Pro，并确保账号能访问 Apps / Developer Mode。
+使用当前能创建自定义 MCP 插件的 ChatGPT 账号和 Web 界面。OpenAI 2026 年 7 月的文档说明：包含写入和修改操作的完整 MCP 目前面向 Business、Enterprise 和 Edu；Pro 目前只能连接 read/fetch 权限的 MCP App。该文档没有把 Plus 列为支持自定义 MCP 的账号层级。
 
-当前测试显示，Free / Go 账号不暴露 CodexPro 需要的 App 创建流程。
-
-CodexPro 不解锁 Developer Mode，不解锁模型，不绕过账号限制，也不提供账号访问。它只连接你自己的 ChatGPT App 界面和你自己的本地仓库。
+CodexPro 不解锁 Plugins，不解锁模型，不绕过账号限制，也不提供账号访问。它只连接你自己的 ChatGPT Plugins 界面和你自己的本地仓库。
 
 ## 推荐安装方式是什么？
+
+注意：这个 FAQ 跟随 GitHub `main`。假设某个 `main` 功能已经进入 `codexpro@latest` 前，请先看 npm badge/version。
 
 全局安装一次：
 
@@ -30,20 +30,62 @@ codexpro start
 
 `npx codexpro@latest start` 仍然可用，但普通用户更容易理解全局安装。
 
+## 怎么更新 CodexPro？
+
+没有 `codexpro update` 命令。重新安装最新包并重启连接即可：
+
+```bash
+npm install -g codexpro@latest
+codexpro --version
+```
+
+然后停掉旧进程，在启动仓库里重新运行 `codexpro start`。`~/.codexpro` 下的已保存配置会保留。
+
+如果文档写了某个功能，但 `codexpro --version` 还没有，说明 GitHub `main` 比 npm `latest` 新。等下一版发布，或从带 tag 的 GitHub release 安装。
+
+## CodexPro 和网页版自带 Agent 有什么区别？
+
+用途不同。
+
+ChatGPT 网页版 Agent 适合浏览、网页研究和通用网页任务。默认情况下，它不能打开你电脑上的本地 Git 仓库，不能读 `AGENTS.md`，不能看当前分支/`git diff`，也不能在你批准的本地工作区内做受控编辑或跑本地验证命令。
+
+CodexPro 是本地 MCP bridge：用你自己的 ChatGPT 会话，通过 Plugins 连接你电脑上明确允许的仓库。Developer mode 只是创建自定义插件所需的设置开关。它不是网页 Agent 的替代品，也不绕过账号限制，更不是远程 shell 服务。
+
+网页工作用网页 Agent；本地仓库是事实来源时用 CodexPro。
+
+## 怎么把 ChatGPT 附件导入仓库？
+
+在 workspace write 模式下，CodexPro 会暴露 `import_file`。ChatGPT 需要传入 Apps SDK 文件对象：
+
+```json
+{
+  "download_url": "https://...",
+  "file_id": "file_...",
+  "mime_type": "image/png",
+  "file_name": "screenshot.png"
+}
+```
+
+该参数通过 `_meta["openai/fileParams"]` 声明。CodexPro 只会从已批准的 ChatGPT/OpenAI 文件域名下载临时 HTTPS URL，遵守 `CODEXPRO_MAX_IMPORT_BYTES`，拒绝私网/回环重定向，并且只写入已允许的工作区。默认不允许覆盖。任意用户或模型自行提供的下载 URL 会被拒绝。
+
+如果客户端没有同时提供 `download_url` 和 `file_id`，工具会返回 unsupported-reference 错误，并且不会创建任何文件。
+
 ## ChatGPT 里要打开什么设置？
 
 在 ChatGPT 中打开：
 
 ```text
 Settings
--> Apps
--> Advanced settings
+-> Security and login
 -> Developer mode: on
 -> Enforce CSP in developer mode: on
--> Create app
+
+Settings
+-> Plugins
+-> Create
 ```
 
-Create App 填：
+创建 Plugin 时填写：
 
 ```text
 Name: CodexPro
@@ -71,7 +113,7 @@ CodexPro 不绕过、不提升、不合并、不转售、不修改 ChatGPT、Cod
 
 ## CodexPro 可以使用 GPT-5.5 吗？
 
-前提是你的 ChatGPT 账号已经在 Web 产品里提供这个模型或同级更强模型，并且该模型界面可以调用 Developer Mode Apps。
+前提是你的 ChatGPT 账号已经在 Web 产品里提供这个模型或同级更强模型，并且该模型界面可以调用自定义 MCP 插件。
 
 CodexPro 不提供、不代理、不转售、也不解锁模型。它只给兼容的 ChatGPT 会话提供本地仓库工具。
 
@@ -87,7 +129,7 @@ codexpro pro-bundle --root /path/to/repo --copy
 
 账号权限和模型工具能力是两回事。
 
-Plus / Pro 可以暴露 Apps / Developer Mode，但某个具体模型界面仍然可能不能调用连接器或 MCP 工具。遇到这种情况时，用 `codexpro pro-bundle --copy` 导出上下文，再把计划交给本地代理执行。
+账号权限和具体模型界面的工具调用能力是两回事，而且可用范围可能变化。遇到不能调用 MCP 工具的界面时，用 `codexpro pro-bundle --copy` 导出上下文，再把计划交给本地代理执行。
 
 ## ChatGPT 能通过 CodexPro 看到什么？
 
@@ -160,6 +202,7 @@ codexpro start --mode handoff --no-bash
 快速 demo：          Cloudflare quick tunnel
 推荐稳定 URL：       ngrok free dev domain
 自定义域名：          Cloudflare named tunnel
+Tailnet 用户：        Tailscale Funnel
 无公网 URL：          local-only，只适合能访问 localhost 的 MCP 客户端
 ```
 
@@ -168,6 +211,38 @@ Cloudflare quick tunnel 每次重启 URL 都变。把 quick URL 填到 ChatGPT �
 大多数用户建议用 ngrok free dev domain。创建免费 ngrok 账号，在 Universal Gateway -> Domains 找到分配给你的 dev domain，并在 `codexpro setup` 里保存。
 
 如果你有自己的域名，用 Cloudflare named tunnel，把 DNS 路由到例如 `codexpro.example.com` 的主机名。
+
+## ChatGPT 创建 connector 时显示 “Something went wrong” 怎么办？
+
+通常是 ChatGPT 无法访问公网 MCP URL。生成 `trycloudflare.com` URL 不代表 `cloudflared` 一直连通。
+
+运行连接测试：
+
+```bash
+codexpro connection-test --root /path/to/repo
+```
+
+这个模式保留 `read`、`tree`、`search` 和 `load_skill`，关闭文件写入、bash
+和 tool cards，并记录请求是否到达本地 MCP endpoint。在 ChatGPT 的
+`Settings -> Plugins` 创建 development plugin，粘贴完整 Server URL，
+Authentication 选择 `No Authentication`。
+
+- 没有 `POST /mcp received`：请求没有到达 CodexPro，检查 ChatGPT Plugins 页面和 tunnel。
+- `POST /mcp -> 401`：请粘贴包含 `codexpro_token` 的完整 URL。
+- `POST /mcp -> 2xx`：ChatGPT 已到达 CodexPro，MCP endpoint 也已响应。
+
+URL token 只适合作为个人 connector 的兼容方式。共享或多用户生产部署必须使用 OAuth 或
+`Authorization: Bearer <token>`。CodexPro 要求 token 至少 24 个字节，本地引导页加载后
+会从浏览器地址中移除 token 参数，并限制重复失败的认证尝试。
+
+测试期间保持 CodexPro 运行。Cloudflare quick tunnel 每次重启都会更换 URL。
+如果 Cloudflare 返回 `530` / `Error 1033`，检查运行 `cloudflared` 的机器上的
+DNS 或代理客户端 DNS 设置。
+
+ChatGPT 现在在 Plugins 中管理 development app。浏览器错误
+`Failed to execute 'removeChild' on 'Node'` 发生在 ChatGPT 页面中，早于任何
+CodexPro MCP 请求。请在 Plugins 页面删除或重建旧条目，再使用当前 URL 重试；
+CodexPro 无法修复浏览器端的旧条目。
 
 ## 能每天使用同一个 ChatGPT App URL 吗？
 
@@ -197,16 +272,39 @@ Cloudflare quick tunnel 是一次性的临时地址。每次重新启动 tunnel�
 
 ## 同时跑两个仓库怎么办？
 
-给每个仓库使用不同本地端口和不同 tunnel hostname。
+如果只是希望通过同一个 connector 切换项目，先在启动仓库保存额外项目：
 
-示例：
-
-```text
-repo A: port 8787, hostname A
-repo B: port 8788, hostname B
+```bash
+cd ~/code/app
+codexpro settings set --project ~/code/web --project ~/code/api
+codexpro settings show
+codexpro start
 ```
 
-分别在两个仓库里运行 `codexpro setup` 并保存 profile。
+确认输出里的 `Projects` 列出了额外根目录，然后重启 connector，管理页 Allowed Roots 才会刷新。让 ChatGPT 打开已允许的项目。`open_workspace` 会把它设为当前 MCP session 的选择，之后其他工具可以省略 `workspace_id`。`open_current_workspace` 会切回启动时的主项目。
+
+清除已保存的额外项目：
+
+```bash
+codexpro settings set --clear-projects
+```
+
+项目选择按 MCP session 隔离，但 ChatGPT conversation 不保证和 MCP session 一一对应。需要严格隔离、两个 ChatGPT 账号、或两个 ngrok 域名时，请跑两个 CodexPro 进程，并用不同本地端口和不同公网 hostname：
+
+```text
+repo A: port 8787, hostname A, ChatGPT plugin URL A
+repo B: port 8788, hostname B, ChatGPT plugin URL B
+```
+
+分别在两个仓库里运行 `codexpro setup` 并保存 profile。不要把同一个 Server URL 给两个账号共用。
+
+## 多个 ChatGPT session 怎么避免互相覆盖？
+
+项目选择按 session 隔离。对于共享文件，先读取文件，再把返回的 SHA-256 作为 `expected_sha256` 传给 `write` 或 `edit`。如果读取之后文件已经变化，CodexPro 会拒绝操作。新文件采用原子替换；已有文件原位更新，以保留与 inode 绑定的元数据和硬链接。
+
+这能防止旧内容静默覆盖新内容，但不会把 CodexPro 变成协同 merge server。大范围重叠修改仍建议使用独立 worktree。
+
+后台运行或交给 service manager 时，使用 `codexpro start --headless`。它不会提问、访问剪贴板或打开浏览器；会用 `CODEXPRO_READY` 报告就绪，HTTP runtime 意外退出时 launcher 会以非零状态退出。
 
 ## 能不能用 codexpro.github.io？
 
@@ -228,7 +326,7 @@ https://rebel0789.github.io/codexpro/zh.html
 
 ## CodexPro 是否违反服务条款？
 
-CodexPro 使用 ChatGPT 的官方 Developer Mode / MCP App 接入路径，让你自己的 ChatGPT 会话连接到你自己的本地工具。
+CodexPro 使用 ChatGPT 的官方 Plugins + MCP 接入路径，让你自己的 ChatGPT 会话连接到你自己的本地工具。Developer mode 只是创建自定义插件所需的设置开关。
 
 它不绕过限制，不抓取隐藏接口，不共享账号，不转售模型，不伪造请求来源，也不把第三方模型包装成别的模型。
 

@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
 import { timingSafeEqual } from "node:crypto";
+import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
-import cors from "cors";
 import { z } from "zod";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { loadConfig, type CodexProConfig } from "./config.js";
+import { expandHome, loadConfig, type CodexProConfig } from "./config.js";
 import {
   profilePathForRoot,
   readRuntimeConnection,
@@ -17,7 +17,11 @@ import {
   type TunnelMode,
   type WorkspaceProfile
 } from "./profileStore.js";
+import { redactSensitiveText, redactStructured } from "./redact.js";
 import { createCodexProServer } from "./server.js";
+import { WorkspaceRegistry } from "./guard.js";
+import { redactConfigPaths } from "./pathLabels.js";
+import { CODEXPRO_VERSION } from "./version.js";
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -45,7 +49,7 @@ function copyCommand(title: string, description: string, command: string, displa
   </div>`;
 }
 
-const TUNNELS = ["cloudflare", "ngrok", "cloudflare-named", "none"] as const;
+const TUNNELS = ["cloudflare", "ngrok", "cloudflare-named", "tailscale", "none"] as const;
 const MODES = ["agent", "handoff", "pro"] as const;
 const BASH_MODES = ["safe", "off", "full"] as const;
 const BASH_TRANSCRIPTS = ["compact", "full"] as const;
@@ -72,6 +76,7 @@ const AdminProfilePatch = z.object({
   requireBashSession: z.boolean().optional(),
   write: z.enum(WRITE_MODES).optional(),
   toolMode: z.enum(TOOL_MODES).optional(),
+  toolCards: z.boolean().optional(),
   widgetDomain: textField(2048),
   tunnelName: textField(128),
   ngrokConfig: textField(4096),
@@ -99,6 +104,7 @@ interface ProfileFormValues {
   requireBashSession: boolean;
   write: "off" | "handoff" | "workspace";
   toolMode: "minimal" | "standard" | "full";
+  toolCards: boolean;
   widgetDomain: string;
   noInstallCloudflared: boolean;
 }
@@ -135,6 +141,20 @@ function normalizeWidgetDomain(value: string | undefined): string {
   return url.origin;
 }
 
+function effectiveWriteMode(mode: ConnectorMode, write: ProfileFormValues["write"]): ProfileFormValues["write"] {
+  if (mode === "agent") return write;
+  return write === "off" ? "off" : "handoff";
+}
+
+function normalizeProfilePath(root: string, value: string | undefined): string {
+  const raw = value?.trim() ?? "";
+  if (!raw) return "";
+  const expanded = expandHome(raw);
+  return path.isAbsolute(expanded) || path.win32.isAbsolute(expanded)
+    ? path.resolve(expanded)
+    : path.resolve(root, expanded);
+}
+
 function profileValues(config: CodexProConfig, profile = readWorkspaceProfile(config.defaultRoot)): ProfileFormValues {
   const hostname =
     profile.hostname ??
@@ -142,9 +162,11 @@ function profileValues(config: CodexProConfig, profile = readWorkspaceProfile(co
     process.env.CODEXPRO_HOSTNAME ??
     process.env.NGROK_DOMAIN ??
     "";
+  const mode = oneOf(profile.mode ?? process.env.CODEXPRO_MODE, MODES, "agent");
+  const write = effectiveWriteMode(mode, oneOf(profile.write ?? config.writeMode, WRITE_MODES, config.writeMode));
   return {
     port: String(profile.port ?? config.port),
-    mode: oneOf(profile.mode ?? process.env.CODEXPRO_MODE, MODES, "agent"),
+    mode,
     tunnel: oneOf(profile.tunnel, TUNNELS, runtimeTunnelFallback()),
     hostname: String(hostname),
     tunnelName: String(profile.tunnelName ?? ""),
@@ -157,8 +179,9 @@ function profileValues(config: CodexProConfig, profile = readWorkspaceProfile(co
     codexDir: String(profile.codexDir ?? config.codexDir),
     bashSession: String(profile.bashSession ?? config.bashSessionId ?? ""),
     requireBashSession: Boolean(profile.requireBashSession ?? config.requireBashSession),
-    write: oneOf(profile.write ?? config.writeMode, WRITE_MODES, config.writeMode),
+    write,
     toolMode: oneOf(profile.toolMode ?? config.toolMode, TOOL_MODES, config.toolMode),
+    toolCards: Boolean(profile.toolCards ?? config.toolCards),
     widgetDomain: String(profile.widgetDomain ?? config.widgetDomain),
     noInstallCloudflared: Boolean(profile.noInstallCloudflared)
   };
@@ -168,6 +191,7 @@ const OPTION_LABELS: Record<string, string> = {
   cloudflare: "Cloudflare quick tunnel",
   ngrok: "ngrok stable URL",
   "cloudflare-named": "Cloudflare named tunnel",
+  tailscale: "Tailscale Funnel",
   none: "Local only",
   agent: "Agent",
   handoff: "Handoff",
@@ -195,9 +219,10 @@ function selectOptions(values: readonly string[], current: string): string {
 
 function serverUrlDisplay(endpoint: string | undefined, authEnabled: boolean): string {
   if (!endpoint) return "";
-  if (!authEnabled) return endpoint;
-  const glue = endpoint.includes("?") ? "&" : "?";
-  return `${endpoint}${glue}codexpro_token=<redacted>`;
+  const safeEndpoint = redactSensitiveText(endpoint);
+  if (!authEnabled) return safeEndpoint;
+  const glue = safeEndpoint.includes("?") ? "&" : "?";
+  return `${safeEndpoint}${glue}codexpro_token=<redacted>`;
 }
 
 function currentTunnelMessage(tunnel: TunnelMode, endpoint: string): string {
@@ -205,11 +230,13 @@ function currentTunnelMessage(tunnel: TunnelMode, endpoint: string): string {
     if (tunnel === "cloudflare") return "Cloudflare generated this URL for the current run. Quick tunnel URLs change after restart.";
     if (tunnel === "ngrok") return "ngrok is using the saved public hostname for this run.";
     if (tunnel === "cloudflare-named") return "Cloudflare named tunnel is using the saved public hostname for this run.";
+    if (tunnel === "tailscale") return "Tailscale Funnel is using the saved ts.net hostname for this run.";
     return "Local-only endpoint for clients that can reach this machine.";
   }
   if (tunnel === "cloudflare") return "Cloudflare quick tunnels print a generated URL after the tunnel opens.";
   if (tunnel === "ngrok") return "Enter your reserved ngrok domain, or set NGROK_DOMAIN before starting CodexPro.";
   if (tunnel === "cloudflare-named") return "Enter the Cloudflare hostname routed to your named tunnel.";
+  if (tunnel === "tailscale") return "Enter the Tailscale Funnel hostname for this device, for example machine.tailnet.ts.net.";
   return "No public tunnel is saved; local MCP clients can use the local URL.";
 }
 
@@ -236,7 +263,7 @@ function profileForm(config: CodexProConfig): string {
           <code>${escapeHtml(runtimeUrl)}</code>
           <p>${escapeHtml(currentTunnelMessage(runtimeTunnel, runtimeEndpoint))}</p>
         </div>
-        <button type="button" class="copy-mini" data-copy-kind="server-url" data-copy-base="${escapeHtml(runtimeEndpoint)}">Copy</button>
+        <button type="button" class="copy-mini" data-copy-kind="server-url" data-copy-base="${escapeHtml(redactSensitiveText(runtimeEndpoint))}">Copy</button>
       </div>`
     : `<div class="current-url idle">
         <div>
@@ -244,7 +271,7 @@ function profileForm(config: CodexProConfig): string {
           <code>${savedUrl ? escapeHtml(savedUrl) : "No public URL detected for this run"}</code>
           <p>${escapeHtml(savedUrl ? "This is based on the saved hostname. It becomes current after the launcher starts that tunnel." : currentTunnelMessage(values.tunnel, ""))}</p>
         </div>
-        ${savedEndpoint ? `<button type="button" class="copy-mini" data-copy-kind="server-url" data-copy-base="${escapeHtml(savedEndpoint)}">Copy</button>` : ""}
+        ${savedEndpoint ? `<button type="button" class="copy-mini" data-copy-kind="server-url" data-copy-base="${escapeHtml(redactSensitiveText(savedEndpoint))}">Copy</button>` : ""}
       </div>`;
   return `<section class="panel profile-panel" id="profile">
       <div class="section-head">
@@ -264,8 +291,13 @@ function profileForm(config: CodexProConfig): string {
             <label><span>Public hostname</span><input name="hostname" value="${escapeHtml(values.hostname)}" data-hostname-input data-autofilled="0"></label>
             <label><span>Port</span><input name="port" type="number" min="1" max="65535" value="${escapeHtml(values.port)}"></label>
             <label><span>Mode</span><select name="mode">${selectOptions(MODES, values.mode)}</select></label>
+            <label><span>Cloudflare tunnel name</span><input name="tunnelName" value="${escapeHtml(values.tunnelName)}"></label>
+            <label><span>ngrok config file</span><input name="ngrokConfig" value="${escapeHtml(values.ngrokConfig)}"></label>
+            <label><span>Cloudflare config file</span><input name="cloudflareConfig" value="${escapeHtml(values.cloudflareConfig)}"></label>
+            <label><span>Cloudflare token file</span><input name="cloudflareTokenFile" value="${escapeHtml(values.cloudflareTokenFile)}"></label>
           </div>
           <p class="field-help" data-hostname-help>${escapeHtml(currentTunnelMessage(values.tunnel, runtimeEndpoint))}</p>
+          <label class="check-row"><input name="noInstallCloudflared" type="checkbox" value="true"${values.noInstallCloudflared ? " checked" : ""}><span>Do not auto-install cloudflared</span></label>
         </fieldset>
         <fieldset class="profile-group">
           <legend>Runtime policy</legend>
@@ -278,6 +310,7 @@ function profileForm(config: CodexProConfig): string {
             <label><span>Codex directory</span><input name="codexDir" value="${escapeHtml(values.codexDir)}"></label>
             <label><span>Bash session</span><input name="bashSession" value="${escapeHtml(values.bashSession)}"></label>
           </div>
+          <label class="check-row"><input name="toolCards" type="checkbox" value="true"${values.toolCards ? " checked" : ""}><span>Enable ChatGPT tool cards</span></label>
           <label class="check-row"><input name="requireBashSession" type="checkbox" value="true"${values.requireBashSession ? " checked" : ""}><span>Require matching bash session id</span></label>
         </fieldset>
         <fieldset class="profile-group readonly-group">
@@ -306,25 +339,31 @@ function buildProfilePayload(config: CodexProConfig, existing: WorkspaceProfile,
     noInstallCloudflared: input.noInstallCloudflared ?? current.noInstallCloudflared
   };
   next.hostname = normalizePublicHostname(next.hostname);
+  if (next.tunnel !== "ngrok" && next.tunnel !== "cloudflare-named" && next.tunnel !== "tailscale") next.hostname = "";
   next.widgetDomain = normalizeWidgetDomain(next.widgetDomain);
-  if ((next.tunnel === "ngrok" || next.tunnel === "cloudflare-named") && !next.hostname) {
-    throw new Error("hostname is required for ngrok and cloudflare-named profiles.");
+  if ((next.tunnel === "ngrok" || next.tunnel === "cloudflare-named" || next.tunnel === "tailscale") && !next.hostname) {
+    throw new Error("hostname is required for ngrok, cloudflare-named, and tailscale profiles.");
   }
   if (next.requireBashSession && !next.bashSession) {
     throw new Error("requireBashSession requires a bashSession value.");
   }
 
   const token = typeof existing.token === "string" && existing.token ? existing.token : config.authToken ?? "";
-  const cloudflareToken = typeof existing.cloudflareToken === "string" && existing.cloudflareToken ? existing.cloudflareToken : "";
+  const cloudflareToken = next.tunnel === "cloudflare-named" && typeof existing.cloudflareToken === "string" && existing.cloudflareToken ? existing.cloudflareToken : "";
+  const write = effectiveWriteMode(next.mode, next.write);
+  const tunnelName = next.tunnel === "cloudflare-named" ? next.tunnelName : "";
+  const ngrokConfig = next.tunnel === "ngrok" ? normalizeProfilePath(config.defaultRoot, next.ngrokConfig) : "";
+  const cloudflareConfig = next.tunnel === "cloudflare-named" ? normalizeProfilePath(config.defaultRoot, next.cloudflareConfig) : "";
+  const cloudflareTokenFile = next.tunnel === "cloudflare-named" ? normalizeProfilePath(config.defaultRoot, next.cloudflareTokenFile) : "";
   return {
     port: next.port,
     mode: next.mode,
     tunnel: next.tunnel,
     ...(next.hostname ? { hostname: next.hostname } : {}),
-    ...(next.tunnelName ? { tunnelName: next.tunnelName } : {}),
-    ...(next.ngrokConfig ? { ngrokConfig: next.ngrokConfig } : {}),
-    ...(next.cloudflareConfig ? { cloudflareConfig: next.cloudflareConfig } : {}),
-    ...(next.cloudflareTokenFile ? { cloudflareTokenFile: next.cloudflareTokenFile } : {}),
+    ...(tunnelName ? { tunnelName } : {}),
+    ...(ngrokConfig ? { ngrokConfig } : {}),
+    ...(cloudflareConfig ? { cloudflareConfig } : {}),
+    ...(cloudflareTokenFile ? { cloudflareTokenFile } : {}),
     ...(token ? { token } : {}),
     ...(cloudflareToken ? { cloudflareToken } : {}),
     bash: next.bash,
@@ -333,9 +372,11 @@ function buildProfilePayload(config: CodexProConfig, existing: WorkspaceProfile,
     ...(next.codexDir ? { codexDir: next.codexDir } : {}),
     ...(next.bashSession ? { bashSession: next.bashSession } : {}),
     ...(next.requireBashSession ? { requireBashSession: true } : {}),
-    write: next.write,
+    write,
     toolMode: next.toolMode,
+    toolCards: next.toolCards,
     ...(next.widgetDomain ? { widgetDomain: next.widgetDomain } : {}),
+    ...(existing.allowedRoots?.length ? { allowedRoots: existing.allowedRoots } : {}),
     ...(next.noInstallCloudflared ? { noInstallCloudflared: true } : {})
   };
 }
@@ -343,7 +384,7 @@ function buildProfilePayload(config: CodexProConfig, existing: WorkspaceProfile,
 function profileResponse(config: CodexProConfig): Record<string, unknown> {
   const profile = readWorkspaceProfile(config.defaultRoot);
   const runtime = readRuntimeConnection(config.defaultRoot);
-  return {
+  return redactConfigPaths(config, redactStructured({
     ok: true,
     profile_path: profile.profilePath ?? profilePathForRoot(config.defaultRoot),
     exists: Boolean(profile.profilePath),
@@ -358,10 +399,11 @@ function profileResponse(config: CodexProConfig): Record<string, unknown> {
       codexSessions: config.codexSessions,
       writeMode: config.writeMode,
       toolMode: config.toolMode,
+      toolCards: config.toolCards,
       widgetDomain: config.widgetDomain,
       authEnabled: Boolean(config.authToken)
     }
-  };
+  }), { labelUnknownPaths: true });
 }
 
 function jsonError(res: Response, status: number, code: string, message: string, issues?: unknown): void {
@@ -376,6 +418,18 @@ const LOCAL_FAVICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 6
   <rect x="8" y="8" width="48" height="48" rx="12" fill="#ffffff" fill-opacity=".12" stroke="#ffffff" stroke-opacity=".38"/>
   <path d="M38.4 40.3c-1.8 1.1-3.9 1.7-6.3 1.7-6.1 0-10.3-4.2-10.3-10s4.2-10 10.4-10c2.4 0 4.5.6 6.2 1.7l-2.1 4.1c-1.1-.7-2.3-1-3.8-1-2.9 0-4.9 2.1-4.9 5.2s2 5.2 4.9 5.2c1.5 0 2.8-.4 3.9-1.1l2 4.2Z" fill="#ffffff"/>
 </svg>`;
+function printHelp(): void {
+  console.log(`CodexPro MCP HTTP server
+
+Usage:
+  codexpro-mcp-http --root /path/to/repo --port 8787
+  codexpro-mcp-http --version
+  codexpro-mcp-http --help
+
+Set CODEXPRO_HTTP_TOKEN for public/tunnel use.
+For trusted local-only testing, set CODEXPRO_ALLOW_NO_HTTP_TOKEN=1.
+Most users should run: codexpro start`);
+}
 
 function onboardingPage(config: CodexProConfig): string {
   const localMcp = `http://${config.host}:${config.port}/mcp`;
@@ -404,14 +458,14 @@ function onboardingPage(config: CodexProConfig): string {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" href="/favicon.ico">
-  <title>CodexPro Admin</title>
+  <title>CodexPro Local Control - ChatGPT Workspace Agent</title>
   <style>
     /* Hallmark · pre-emit critique: P5 H5 E5 S5 R5 V5 */
     /* Hallmark · macrostructure: Workbench · genre: modern-minimal · theme: CC Switch-inspired light manager · tone: technical admin · nav: section switcher · footer: Ft2 · contrast: pass (40-41) · mobile: pass (34, 49, 50-57) */
     :root {
       color-scheme: light;
-      --font-display: "Inter", "Geist", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      --font-body: "Inter", "Geist", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --font-display: "Geist", "Aptos", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --font-body: "Geist", "Aptos", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       --font-mono: "Fira Code", "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       --color-paper: oklch(98.5% 0.004 250);
       --color-surface: oklch(100% 0 0);
@@ -714,6 +768,7 @@ function onboardingPage(config: CodexProConfig): string {
       font-size: 12px;
       font-weight: 800;
       line-height: 1;
+      white-space: nowrap;
     }
     .warn {
       border-color: var(--color-warn);
@@ -1115,6 +1170,10 @@ function onboardingPage(config: CodexProConfig): string {
       .panel {
         padding: var(--space-4);
       }
+      .section-head {
+        align-items: start;
+        flex-direction: column;
+      }
       h1 {
         font-size: 1.85rem;
       }
@@ -1159,12 +1218,12 @@ function onboardingPage(config: CodexProConfig): string {
       <div class="brand">
         <span class="logo" aria-hidden="true"><img src="/favicon.ico" alt=""></span>
         <span>
-          <span class="brand-kicker">Local admin</span>
+          <span class="brand-kicker">Workspace control</span>
           <span class="brand-title">CodexPro</span>
         </span>
       </div>
       <nav class="quick-links" aria-label="CodexPro resources">
-        <a class="action-link primary-link" href="${chatgptUrl}" target="_blank" rel="noreferrer">Open ChatGPT</a>
+        <a class="action-link primary-link" href="${chatgptUrl}" target="_blank" rel="noreferrer">Open ChatGPT settings</a>
         <a class="resource-link" href="${githubUrl}" target="_blank" rel="noreferrer">Open GitHub</a>
         <a class="resource-link" href="${npmUrl}" target="_blank" rel="noreferrer">NPM</a>
         <a class="resource-link" href="${docsUrl}" target="_blank" rel="noreferrer">Docs</a>
@@ -1184,18 +1243,18 @@ function onboardingPage(config: CodexProConfig): string {
           <div class="section-head">
             <div>
               <h2>Quick path</h2>
-              <p>For a new local admin session, do these in order.</p>
+              <p>Use ChatGPT like a coding agent for this workspace without widening the local trust boundary.</p>
             </div>
           </div>
           <div class="guide-list">
-            <div class="guide-item"><span class="num">1</span><span><strong>Check the profile</strong><p>Save the tunnel, port, mode, bash, write, tool, Codex sessions, and working directory defaults for the next launch.</p></span></div>
+            <div class="guide-item"><span class="num">1</span><span><strong>Review the profile</strong><p>Choose the tunnel, port, mode, bash, write, tool, Codex session, and workspace defaults for the next launch.</p></span></div>
             <div class="guide-item"><span class="num">2</span><span><strong>Copy the Server URL</strong><p>Use the current public URL shown in the profile when available, or the one printed by the terminal after launch.</p></span></div>
-            <div class="guide-item"><span class="num">3</span><span><strong>Open ChatGPT settings</strong><p>Create an app connection, choose Server URL, paste the public URL, and use no extra authentication.</p></span></div>
-            <div class="guide-item"><span class="num">4</span><span><strong>Restart for policy changes</strong><p>Saved profile changes apply when CodexPro starts again. This keeps the live server predictable.</p></span></div>
+            <div class="guide-item"><span class="num">3</span><span><strong>Create a personal ChatGPT app</strong><p>Choose Server URL, paste the copied URL, and use no extra authentication. This private URL is for one user's connector, not a shared deployment.</p></span></div>
+            <div class="guide-item"><span class="num">4</span><span><strong>Restart for policy changes</strong><p>Saved profile changes apply when CodexPro starts again. The live server does not mutate under an active ChatGPT session.</p></span></div>
           </div>
         </section>
         <article class="run-card" id="status" aria-label="Current runtime">
-          <h2>Current session</h2>
+          <h2>Runtime guardrails</h2>
           <div class="status">
             <div class="row"><span class="label">Workspace</span><span class="mono">${escapeHtml(config.defaultRoot)}</span></div>
             <div class="row"><span class="label">Local MCP</span><span class="mono">${escapeHtml(localMcp)}</span></div>
@@ -1215,7 +1274,7 @@ function onboardingPage(config: CodexProConfig): string {
       <section class="panel" id="connect">
         <div class="section-head">
           <div>
-            <h2>Connect ChatGPT</h2>
+          <h2>Connect ChatGPT</h2>
             <p>Create an app connection that points at the public Server URL copied by the terminal.</p>
           </div>
         </div>
@@ -1223,7 +1282,7 @@ function onboardingPage(config: CodexProConfig): string {
           <li><span class="num">1</span><span>Open ChatGPT settings and create an app connection.</span></li>
           <li><span class="num">2</span><span>Set Connection to <code>Server URL</code>.</span></li>
           <li><span class="num">3</span><span>Paste the public CodexPro URL from the terminal.</span></li>
-          <li><span class="num">4</span><span>Use <code>No Authentication / None</code>; the private token is already in the copied URL.</span></li>
+          <li><span class="num">4</span><span>For a personal connector, use <code>No Authentication / None</code>; the private token is already in the copied URL. Shared production access requires OAuth or an Authorization header.</span></li>
         </ol>
         <p class="note"><a class="action-link" href="${chatgptUrl}" target="_blank" rel="noreferrer">Open ChatGPT settings</a></p>
       </section>
@@ -1253,22 +1312,27 @@ function onboardingPage(config: CodexProConfig): string {
       <ul class="roots">${allowedRoots}</ul>
       <p class="note">CodexPro rejects workspace access outside these roots.</p>
     </details>
-    <footer class="foot">Local admin surface for status, saved profile settings, CLI restart commands, and MCP access. Public sharing still happens through your chosen tunnel.</footer>
+    <footer class="foot">Token-protected local control surface for this workspace. Public sharing still happens only through your chosen tunnel.</footer>
   </main>
   <script>
+    const initialUrl = new URL(window.location.href);
+    const connectorToken = initialUrl.searchParams.get("codexpro_token") || initialUrl.searchParams.get("token") || "";
+    if (connectorToken) {
+      initialUrl.searchParams.delete("codexpro_token");
+      initialUrl.searchParams.delete("token");
+      const cleanSearch = initialUrl.searchParams.toString();
+      history.replaceState(null, "", initialUrl.pathname + (cleanSearch ? "?" + cleanSearch : "") + initialUrl.hash);
+    }
+    const adminProfileUrl = "/admin/profile" + (connectorToken ? "?codexpro_token=" + encodeURIComponent(connectorToken) : "");
     document.querySelectorAll("[data-copy], [data-copy-kind]").forEach((button) => {
       button.addEventListener("click", async () => {
         let value = button.getAttribute("data-copy") || "";
         if (button.getAttribute("data-copy-kind") === "local-mcp") {
           const base = button.getAttribute("data-copy-base") || value;
-          const params = new URLSearchParams(window.location.search);
-          const token = params.get("codexpro_token") || params.get("token") || "";
-          value = token ? base + "?codexpro_token=" + encodeURIComponent(token) : base;
+          value = connectorToken ? base + "?codexpro_token=" + encodeURIComponent(connectorToken) : base;
         } else if (button.getAttribute("data-copy-kind") === "server-url") {
           const base = button.getAttribute("data-copy-base") || value;
-          const params = new URLSearchParams(window.location.search);
-          const token = params.get("codexpro_token") || params.get("token") || "";
-          value = token ? base + "?codexpro_token=" + encodeURIComponent(token) : base;
+          value = connectorToken ? base + "?codexpro_token=" + encodeURIComponent(connectorToken) : base;
         }
         try {
           await navigator.clipboard.writeText(value);
@@ -1313,6 +1377,8 @@ function onboardingPage(config: CodexProConfig): string {
         hostnameHelp.textContent = preview ? "Next Server URL preview: " + preview : "Enter the reserved ngrok domain from your local ngrok setup.";
       } else if (tunnel === "cloudflare-named") {
         hostnameHelp.textContent = preview ? "Next Server URL preview: " + preview : "Enter the hostname routed to your Cloudflare named tunnel.";
+      } else if (tunnel === "tailscale") {
+        hostnameHelp.textContent = preview ? "Next Server URL preview: " + preview : "Enter the Tailscale Funnel hostname for this device.";
       } else {
         hostnameHelp.textContent = "Local-only mode does not expose a public ChatGPT Server URL.";
       }
@@ -1332,19 +1398,25 @@ function onboardingPage(config: CodexProConfig): string {
         const payload = {
           tunnel: data.tunnel,
           hostname: data.hostname,
+          tunnelName: data.tunnelName,
+          ngrokConfig: data.ngrokConfig,
+          cloudflareConfig: data.cloudflareConfig,
+          cloudflareTokenFile: data.cloudflareTokenFile,
           port: Number(data.port),
           mode: data.mode,
           bash: data.bash,
           write: data.write,
           toolMode: data.toolMode,
+          toolCards: Boolean(form.elements.toolCards?.checked),
           codexSessions: data.codexSessions,
           codexDir: data.codexDir,
           bashSession: data.bashSession,
-          requireBashSession: Boolean(form.elements.requireBashSession?.checked)
+          requireBashSession: Boolean(form.elements.requireBashSession?.checked),
+          noInstallCloudflared: Boolean(form.elements.noInstallCloudflared?.checked)
         };
         if (status) status.textContent = "Saving...";
         try {
-          const response = await fetch("/admin/profile" + window.location.search, {
+          const response = await fetch(adminProfileUrl, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(payload)
@@ -1363,6 +1435,16 @@ function onboardingPage(config: CodexProConfig): string {
 }
 
 async function main(): Promise<void> {
+  const argv = process.argv.slice(2);
+  if (argv.includes("--version") || argv.includes("-v") || argv[0] === "version") {
+    console.log(CODEXPRO_VERSION);
+    return;
+  }
+  if (argv.includes("--help") || argv[0] === "help") {
+    printHelp();
+    return;
+  }
+
   const config = loadConfig();
   if (config.requireHttpToken && !config.authToken) {
     throw new Error(
@@ -1374,6 +1456,22 @@ async function main(): Promise<void> {
 
   const app = express();
   const logRequests = process.env.CODEXPRO_LOG_REQUESTS === "1";
+  const connectionDiagnostics = {
+    server_started_at: new Date().toISOString(),
+    requests_received: 0,
+    auth_failures: 0,
+    mcp_requests_received: 0,
+    mcp_dispatches_started: 0,
+    mcp_responses_completed: 0,
+    mcp_errors: 0,
+    last_request_at: null as string | null,
+    last_mcp_request_at: null as string | null,
+    last_dispatch_started_at: null as string | null,
+    last_response_completed_at: null as string | null,
+    last_auth_failure_at: null as string | null
+  };
+  const authFailureWindow = new Map<string, { count: number; resetAt: number }>();
+  const authFailureLimit = 10;
 
   function tokenMatches(value: unknown): boolean {
     if (!config.authToken || typeof value !== "string") return false;
@@ -1410,40 +1508,111 @@ async function main(): Promise<void> {
     next();
   }
 
+  function sameOriginAdminRequest(req: Request, res: Response, next: NextFunction): void {
+    const origin = req.headers.origin;
+    if (!origin) {
+      next();
+      return;
+    }
+    const host = req.get("host");
+    let originHost: string;
+    try {
+      originHost = new URL(origin).host;
+    } catch {
+      jsonError(res, 403, "origin_denied", "Cross-origin admin requests are not allowed.");
+      return;
+    }
+    // A tunnel may terminate TLS before forwarding to this HTTP process, so compare the
+    // browser Origin host with the forwarded Host instead of requiring matching schemes.
+    if (!host || originHost !== host) {
+      jsonError(res, 403, "origin_denied", "Cross-origin admin requests are not allowed.");
+      return;
+    }
+    next();
+  }
+
   app.use((req, res, next) => {
+    const requestTime = new Date().toISOString();
+    const incomingRequestId = Array.isArray(req.headers["x-codexpro-request-id"])
+      ? req.headers["x-codexpro-request-id"][0]
+      : req.headers["x-codexpro-request-id"];
+    const requestId = typeof incomingRequestId === "string" && /^[A-Za-z0-9._:-]{1,96}$/.test(incomingRequestId)
+      ? incomingRequestId
+      : randomUUID();
+    (req as Request & { codexproRequestId?: string }).codexproRequestId = requestId;
+    res.setHeader("X-CodexPro-Request-Id", requestId);
+    connectionDiagnostics.requests_received += 1;
+    connectionDiagnostics.last_request_at = requestTime;
+    if (req.path === "/mcp") {
+      connectionDiagnostics.mcp_requests_received += 1;
+      connectionDiagnostics.last_mcp_request_at = requestTime;
+    }
     if (!logRequests) {
       next();
       return;
     }
     const started = Date.now();
+    console.error(`[CodexPro] ${req.method} ${req.path} received request_id=${requestId}`);
     res.on("finish", () => {
-      console.error(`[CodexPro] ${req.method} ${req.path} -> ${res.statusCode} ${Date.now() - started}ms`);
+      console.error(`[CodexPro] ${req.method} ${req.path} -> ${res.statusCode} ${Date.now() - started}ms request_id=${requestId}`);
     });
     next();
   });
-  app.use(cors({ exposedHeaders: ["Mcp-Session-Id"] }));
   app.get("/favicon.ico", (_req, res) => {
     res.setHeader("Cache-Control", "public, max-age=86400");
     res.type("image/svg+xml").send(LOCAL_FAVICON);
+  });
+  app.use((_req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    next();
   });
   app.use((req, res, next) => {
     if (!config.authToken) {
       next();
       return;
     }
-    const bearer = req.headers.authorization?.startsWith("Bearer ")
-      ? req.headers.authorization.slice("Bearer ".length)
-      : undefined;
+    const bearer = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
     const queryToken = typeof req.query.codexpro_token === "string"
       ? req.query.codexpro_token
       : typeof req.query.token === "string"
         ? req.query.token
         : undefined;
-    if (!tokenMatches(bearer) && !tokenMatches(queryToken)) {
+    if (tokenMatches(bearer) || tokenMatches(queryToken)) {
+      next();
+      return;
+    }
+
+    const now = Date.now();
+    const key = req.ip || req.socket.remoteAddress || "local";
+    const current = authFailureWindow.get(key);
+    if (!current || current.resetAt <= now) {
+      authFailureWindow.set(key, { count: 1, resetAt: now + 60_000 });
+      connectionDiagnostics.auth_failures += 1;
+      connectionDiagnostics.last_auth_failure_at = new Date(now).toISOString();
       res.status(401).send("Unauthorized");
       return;
     }
-    next();
+    current.count += 1;
+    if (authFailureWindow.size > 4096) {
+      for (const [candidate, record] of authFailureWindow) {
+        if (record.resetAt <= now) authFailureWindow.delete(candidate);
+      }
+    }
+    if (current.count > authFailureLimit) {
+      connectionDiagnostics.auth_failures += 1;
+      connectionDiagnostics.last_auth_failure_at = new Date(now).toISOString();
+      res.setHeader("Retry-After", String(Math.max(1, Math.ceil((current.resetAt - now) / 1000))));
+      res.status(429).send("Too Many Authentication Attempts");
+      return;
+    }
+    connectionDiagnostics.auth_failures += 1;
+    connectionDiagnostics.last_auth_failure_at = new Date(now).toISOString();
+    res.status(401).send("Unauthorized");
   });
 
   type TransportRecord = {
@@ -1453,7 +1622,27 @@ async function main(): Promise<void> {
   };
 
   const transports = new Map<string, TransportRecord>();
+  const workspaceRegistry = new WorkspaceRegistry();
   const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  function requestSessionId(req: Request): string | undefined {
+    const value = req.headers["mcp-session-id"];
+    return Array.isArray(value) ? value[0] : value;
+  }
+
+  function sendSessionError(res: Response, sessionId: string | undefined): void {
+    const missing = !sessionId;
+    const malformed = Boolean(sessionId && !sessionIdPattern.test(sessionId));
+    res.status(missing || malformed ? 400 : 404).json({
+      jsonrpc: "2.0",
+      error: missing
+        ? { code: -32000, message: "Bad Request: Mcp-Session-Id header is required" }
+        : malformed
+          ? { code: -32000, message: "Bad Request: invalid MCP session id" }
+          : { code: -32001, message: "Session not found" },
+      id: null
+    });
+  }
 
   function closeTransport(record: TransportRecord): void {
     void record.transport.close?.();
@@ -1496,7 +1685,7 @@ async function main(): Promise<void> {
   });
 
   app.get("/healthz", (_req, res) => {
-    res.json({
+    res.json(redactConfigPaths(config, {
       ok: true,
       name: "CodexPro",
       defaultRoot: config.defaultRoot,
@@ -1511,15 +1700,16 @@ async function main(): Promise<void> {
       widgetDomain: config.widgetDomain,
       contextDir: config.contextDir,
       authEnabled: Boolean(config.authToken),
-      authRequired: config.requireHttpToken
-    });
+      authRequired: Boolean(config.authToken),
+      connection_diagnostics: connectionDiagnostics
+    }, { labelUnknownPaths: true }));
   });
 
   app.get("/admin/profile", (_req, res) => {
     res.json(profileResponse(config));
   });
 
-  app.post("/admin/profile", adminRateLimit, adminBodyLimit, express.json({ limit: "32kb" }), (req, res) => {
+  app.post("/admin/profile", sameOriginAdminRequest, adminRateLimit, adminBodyLimit, express.json({ limit: "32kb" }), (req, res) => {
     const parsed = AdminProfilePatch.safeParse(req.body ?? {});
     if (!parsed.success) {
       jsonError(res, 400, "invalid_profile", "Invalid profile settings.", parsed.error.flatten());
@@ -1545,8 +1735,10 @@ async function main(): Promise<void> {
   });
 
   app.post("/mcp", express.json({ limit: "20mb" }), async (req, res) => {
+    connectionDiagnostics.mcp_dispatches_started += 1;
+    connectionDiagnostics.last_dispatch_started_at = new Date().toISOString();
     try {
-      const sessionId = req.headers["mcp-session-id"] as string | undefined;
+      const sessionId = requestSessionId(req);
       let transport: StreamableHTTPServerTransport;
 
       const existingTransport = getTransport(sessionId);
@@ -1571,24 +1763,23 @@ async function main(): Promise<void> {
           if (closedSessionId) transports.delete(closedSessionId);
         };
 
-        const server = createCodexProServer(config);
+        const server = createCodexProServer(config, { workspaceRegistry });
         await server.connect(transport);
       } else {
-        res.status(400).json({
-          jsonrpc: "2.0",
-          error: { code: -32000, message: "Bad Request: missing or invalid MCP session id" },
-          id: null
-        });
+        sendSessionError(res, sessionId);
         return;
       }
 
       await transport.handleRequest(req, res, req.body);
+      connectionDiagnostics.mcp_responses_completed += 1;
+      connectionDiagnostics.last_response_completed_at = new Date().toISOString();
     } catch (error) {
-      console.error(error);
+      connectionDiagnostics.mcp_errors += 1;
+      console.error(error instanceof Error ? error.stack ?? error.message : String(error));
       if (!res.headersSent) {
         res.status(500).json({
           jsonrpc: "2.0",
-          error: { code: -32603, message: error instanceof Error ? error.message : String(error) },
+          error: { code: -32603, message: "Internal CodexPro MCP error. Check the local terminal for details." },
           id: null
         });
       }
@@ -1596,10 +1787,10 @@ async function main(): Promise<void> {
   });
 
   const handleSessionRequest = async (req: express.Request, res: express.Response) => {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const sessionId = requestSessionId(req);
     const transport = getTransport(sessionId);
     if (!transport) {
-      res.status(400).send("Invalid or missing MCP session id");
+      sendSessionError(res, sessionId);
       return;
     }
     await transport.handleRequest(req, res);
@@ -1607,6 +1798,40 @@ async function main(): Promise<void> {
 
   app.get("/mcp", handleSessionRequest);
   app.delete("/mcp", handleSessionRequest);
+
+  app.use((error: unknown, req: Request, res: Response, next: NextFunction) => {
+    if (!error || typeof error !== "object" || !("type" in error)) {
+      next(error);
+      return;
+    }
+    const type = String((error as { type?: unknown }).type ?? "");
+    if (type !== "entity.parse.failed" && type !== "entity.too.large") {
+      next(error);
+      return;
+    }
+    const status = type === "entity.too.large" ? 413 : 400;
+    if (req.path === "/mcp") {
+      res.status(status).json({
+        jsonrpc: "2.0",
+        error: {
+          code: type === "entity.too.large" ? -32000 : -32700,
+          message: type === "entity.too.large" ? "Payload too large." : "Parse error."
+        },
+        id: null
+      });
+      return;
+    }
+    if (req.path === "/admin/profile") {
+      jsonError(
+        res,
+        status,
+        type === "entity.too.large" ? "payload_too_large" : "invalid_json",
+        type === "entity.too.large" ? "Request body is too large." : "Request body must be valid JSON."
+      );
+      return;
+    }
+    next(error);
+  });
 
   app.listen(config.port, config.host, () => {
     console.error(`[CodexPro] HTTP MCP listening on http://${config.host}:${config.port}/mcp`);

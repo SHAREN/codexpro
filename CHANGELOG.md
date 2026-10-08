@@ -1,7 +1,120 @@
 # Changelog
 
+## 0.30.3 (2026-10-01)
+
+- Fixed Windows handoff runs that could remain `running` after an npm `.cmd` executor exited by settling from the child exit when inherited output handles never close, terminating the full process tree on timeout, and recording the completion source for diagnostics.
+- Updated patched transitive dependencies for brace-expansion denial-of-service and IP-address classification vulnerabilities; the release audit reports zero known vulnerabilities.
+- Reduced Windows CI flakiness by allowing the analysis CLI smoke test enough startup time on slower hosted runners.
+
+## 0.30.2 (2026-09-20)
+
+- Read the runtime and MCP server version from package metadata so release entrypoints cannot drift from `package.json`.
+- Added a clean consumer-install smoke test for the packed npm tarball and all three public command entrypoints.
+- Expanded CI to Node.js 20 and 24 on Linux and Windows, including package-install and high-severity dependency-audit gates.
+- Documented built-in repository intelligence, product focus, and a prioritized public roadmap.
+
+## 0.30.1 (2026-09-20)
+
+- Hardened local handoff receipts: interruptions are recorded as non-terminal `interrupting` and terminal `interrupted` states only after child exit; stale in-flight receipts become `orphaned` only when recorded processes are gone and require reconciliation.
+- Blocked standard Git/GitHub remote mutation paths inside local handoff executors by default; `--allow-remote-mutations` is an explicit opt-in for authorized workflows.
+- Added explicit Windows Bash runtime selection: `auto` prefers Git for Windows and never silently falls back to WSL; WSL requires `CODEXPRO_BASH_RUNTIME=wsl`.
+- Documented an explicit maintainer security contact and advisory-reporting route for repositories where GitHub private vulnerability reporting is unavailable.
+- Search now passes the requested result limit through to ripgrep, preserving truthful truncation reporting for files with many matches.
+- Preserved the connector token for browser profile saves after removing it from history, and hardened the admin page against cross-origin writes.
+- Preserved explicitly opened workspace IDs across HTTP MCP sessions while keeping implicit workspace selection session-local.
+- Stats-only git diffs now use Git numstat directly instead of buffering the complete unified diff.
+- apply_patch now rejects Git's exit-zero skipped-patch result instead of reporting a false successful change.
+- Self-test Pro context checks now run independently of the write probe, and the write probe restores or removes its diagnostic file afterward.
+- Bash timeout schemas now accept the full supported 15-minute ceiling while runtime configuration remains authoritative.
+- Server config and self-test now report whether search is using ripgrep or the bounded Node fallback.
+- Path-scoped Git inspection now uses the nearest allowed repository root, and Windows command output recognizes UTF-16 streams.
+- HTTP health diagnostics now expose bounded request-arrival, dispatch, completion, authentication-failure, and correlation-ID metadata without recording request contents or tokens.
+
+## 0.30.0 (2026-08-08)
+
+- Published the multi-project allowlist that was already on `main`: `codexpro settings set --project`, `--clear-projects`, session-local `open_workspace` selection, and matching FAQ guidance. npm `0.29.0` did not include those commits, which caused empty Allowed Roots reports after following current docs.
+- Rejected invalid relative `HOME` values such as `=` in restricted bash child environments, prefer a usable absolute `USERPROFILE`/`HOME`, and forward Windows `APPDATA`/`LOCALAPPDATA` when valid so npm cache dirs are not created inside workspaces.
+- Raised the bash `timeout_ms` hard cap from 180s to 10 minutes by default (max 15 minutes via `CODEXPRO_MAX_BASH_TIMEOUT_MS`). Per-command default remains 30s.
+- Follow directory symlinks under configured skill roots during skill discovery so managers such as cc-switch can install skills as links. Thanks @yuczzzzz. Keep symlinked/junction skills tagged by their configured scan root and accept both realpathed and caller-supplied home spellings so Windows junctions keep `user` / `~/` identity.
+- Added `import_file` for ChatGPT Apps SDK attachments (`openai/fileParams`), with HTTPS host allowlisting, redirect revalidation, streaming size limits, SHA-256 checks, MIME sniffing, and workspace write-mode gating.
+- Documented update steps (`npm install -g codexpro@latest`), ChatGPT web Agent vs CodexPro, and dual-account / dual-tunnel process separation in the English and Chinese FAQs.
+- Updated transitive dependencies so `npm audit --audit-level=high` reports zero known vulnerabilities.
+
+- Added saved additional projects with `codexpro settings set --project <path>`, session-local workspace selection through the existing `open_workspace` tool, and `--clear-projects` for removing the saved allowlist.
+- Isolated workspace selection between HTTP MCP sessions while preserving explicit workspace-id access for configured roots, with stdio, HTTP, profile, and regression coverage.
+- Added native workspace image inspection for PNG, JPEG, GIF, and WebP files through `view_image`.
+- Added optional SHA-256 preconditions and canonical-path write serialization for `write` and `edit`, preventing stale multi-session edits from silently replacing newer file content. New files use atomic replacement; existing files retain inode-bound metadata and hard-link identity through in-place updates.
+- Added `codexpro start --headless` with non-interactive readiness output, supervised HTTP-runtime failure propagation, runtime PID status, and signal cleanup.
+- Updated the MCP SDK and affected transitive HTTP, URI, and pattern-matching dependencies to patched releases; the release audit now reports zero known vulnerabilities.
+- Hardened public HTTP authentication with a 24-byte minimum token, per-client failed-attempt throttling, no-store/no-referrer browser responses, and immediate removal of onboarding token parameters from the visible URL.
+- Pinned automatic `cloudflared` installation to release `2026.7.2` and verify each supported platform asset against its published SHA-256 before writing or extracting it.
+- Closed cross-session and concurrency gaps by isolating `show_changes` checkpoints per MCP session and making `apply_patch` share canonical per-file write locks with `write` and `edit`.
+- Made bounded ripgrep truncation tolerate an interrupted final JSON record, rejected symlinked `.ai-bridge` handoff paths, and terminated timed-out bash process trees instead of only their direct shell process.
+- Closed the follow-up security findings by rejecting symlinked handoff leaf files, bounding and force-terminating output-heavy bash trees, disabling unbounded regex in the Node search fallback, size-capping verified `cloudflared` downloads, removing `cmd.exe call` re-expansion, excluding internal plans from npm packages, and adding a protected `--token-file` path for stable launches.
+- Added Windows CI coverage and made smoke, stress, tunnel-shim, and runtime-status checks portable across Windows and Unix hosts.
+- Made skill inventory and name-only `load_skill` use one deterministic winner per skill name, with workspace skills taking precedence over user-global and plugin skills.
+- Kept explicit `source` and `path` overrides available for diagnostics or intentionally loading a suppressed duplicate.
+
+## 0.29.0 (2026-07-13)
+
+- Replaced the heavy v9 Apps widget with a compact, host-theme-aware v10 card for selected user-visible results: workspace, analysis, changes, Git status, handoff, and terminal verification.
+- Fixed cards that stayed on a loading placeholder after ChatGPT completed a tool call by accepting bounded nested result envelopes and showing a clear unavailable state instead of an infinite animation.
+- Kept raw reads and searches in normal chat output, added local copy support only for bounded terminal results, and added widget bridge smoke coverage.
+- Added guarded release scripts that reject wrong-folder and `npm --prefix` pack/publish attempts, verify the canonical CodexPro tarball, and require a full release check before publishing.
+
+## 0.29.0-beta.1 (npm beta, 2026-07-11)
+
+- Added bounded multi-language repository analysis, grouped search results, change-impact and test recommendations, `codexpro inspect` / `codexpro review` CLI commands, and compact opt-in tool cards.
+- Added `codexpro connection-test`, a read-only connector profile with no bash or tool cards, plus request-arrival logging and current ChatGPT Plugins troubleshooting.
+- Added Tailscale Funnel as a saved tunnel/profile option, including `codexpro tailscale --hostname ...`, launcher support, admin profile support, and settings smoke coverage.
+- Added proxy-aware Cloudflare quick tunnels: when proxy env vars are set, CodexPro requests quick-tunnel credentials through `curl --proxy`, runs `cloudflared` with a temporary credentials file, ignores Cloudflare API URLs, and cleans the credentials file after shutdown.
+- Hardened Codex handoff execution on Windows by resolving spawnable Codex shims, asking Codex to read the plan file instead of argv-passing the whole plan, and recording git status in handoff artifacts.
+- Added concise connector-creation troubleshooting to the English and Chinese FAQs.
+- Bounded browser-facing tool-card structured payloads and binary-file text checks so CodexPro emits less data without reducing normal tool-result or binary-detection quality.
+- Allowed targeted line-range reads and search matches in text files slightly above `maxReadBytes`, while keeping full-file reads and very large scans bounded.
+- Replaced the overlong README with a shorter install, tunnel, safety, RAM-boundary, and development guide.
+- Added a guarded `apply_patch` MCP tool for unified-diff edits inside workspace write mode, with blocked-path and secret-content checks before patches are applied.
+- Added last-shown review checkpoints to `show_changes`, so repeated unchanged reviews collapse while new workspace changes still produce a fresh diff.
+- Fixed checkpoint-hit `show_changes` responses so repeated unchanged reviews report zero new diff stats instead of carrying stale addition/deletion counts.
+- Scoped `apply_patch` result diffs to the applied patch, so unrelated dirty tracked files are not folded into the patch card.
+- Hardened safe bash filtering, path canonicalization, binary-file checks, ripgrep truncation reporting, and supertool argument validation around edge-case bypasses found by stress testing.
+- Redacted child tunnel process output before logging or surfacing startup failures so Cloudflare `TUNNEL_TOKEN` values cannot leak from failed named-tunnel launches.
+- Kept `codex_sessions` metadata mode from returning transcript-tail summaries, skipped unreadable stale history files, and accepted source paths under symlink-resolved Codex history roots.
+- Hardened search, context export, path blocking, skill loading, and change summaries around hidden files, colon-containing paths, `.env` descendants, large-file limits, user skills, and diff stats.
+- Blocked raw newline and carriage-return command separators in safe bash mode before whitespace normalization, including through the stable `codexpro` supertool wrapper.
+- Corrected docs to describe Developer Mode account eligibility as broader than Plus/Pro while keeping the model/tool-surface limitation explicit.
+
+## 0.28.6 (main, pending npm latest)
+
+- Added the stable `codexpro` supertool wrapper for advanced connector-cache/custom workflows, while preserving tool/write/bash mode gates.
+- Hardened direct HTTP auth defaults, local `--no-auth`, token redaction, search parsing, selected-path Pro exports, and handoff polling state.
+- Added `npm run stress` to cover full-mode MCP behavior, supertool dispatch, skill caps, card payloads, search edge cases, Pro export, and handoff polling.
+- Fixed CLI env precedence so `CODEXPRO_HOST` / `CODEXPRO_PORT` override generic `HOST` / `PORT`, preventing ambient process env from widening a launcher-validated bind.
+- Normalized stable public hostnames in CLI settings/setup/start flows and accepted common `--flag=value` syntax.
+
+- Made ChatGPT tool-card descriptor metadata opt-in with `CODEXPRO_TOOL_CARDS=1`, so default `tools/list` responses stay plain MCP and avoid fragile widget metadata during tool discovery.
+- Added `codexpro loop-handoff` for bounded local execute/review loops over `.ai-bridge/current-plan.md`, with a required local `--review-command`, `--max-iters`, dry-run preview, optional test command capture, and stop conditions for no diff, repeated diff, missing follow-up plans, reviewer errors, and human cancellation.
+- Hardened `loop-handoff` external-command boundaries: commands are preflighted before execution, reviewer verdicts require explicit `CODEXPRO_REVIEW=...` assignment lines by default, and reviewer `PASS` no longer masks failed executor/test/reviewer commands unless the user opts into the supported override behavior.
+- Fixed loop change detection so `--stop-if-no-files-changed` and `--stop-if-same-diff` compare each iteration against a pre-execution baseline and count unstaged diffs, staged diffs, and untracked file fingerprints outside `.ai-bridge`.
+- Switched loop guard decisions to an uncapped git-state fingerprint instead of hashing or vetoing on the trimmed reviewer diff artifact.
+- Kept handoff plan hashing on the handoff read-size budget instead of `--max-output-bytes`, so valid plans larger than captured output excerpts do not abort the loop after execution.
+- Made loop change fingerprints content/status based instead of timestamp based, so repeated identical tracked-file writes stop as no new changes instead of looking different because of volatile mtimes.
+- Normalized Git porcelain paths back to workspace-relative paths before loop clean-start filtering and change fingerprinting, with path-scoped status and untracked-file scans so nested workspaces inside larger Git repos are handled correctly.
+- Bounded untracked file fingerprinting so symlinks are reported via `readlink` and regular files hash only a capped prefix instead of following arbitrary paths or reading entire generated artifacts.
+- Tightened `--require-clean-git-start` so staged renames are treated as handoff-only only when both rename endpoints are inside `.ai-bridge`.
+- Stopped reviewer `FAIL` and implicit review verdicts from continuing when the reviewer deletes, empties, or restores `.ai-bridge/current-plan.md` to the scaffold instead of writing a usable follow-up plan.
+- Kept the autonomous handoff loop CLI-only and local-terminal-owned; it does not expose agent execution as a remote MCP tool, automate ChatGPT Web, approve product prompts, proxy models, or bypass limits.
+- Extended handoff smoke coverage with a fake reviewer that fails once by writing a follow-up plan, then passes on the second local executor iteration, plus failed executor, failed reviewer, bare `PASS`, staged-only, untracked-file, bounded-untracked, dirty-baseline, repeated-identical-write, nested-workspace, nested-untracked-workspace, outside-untracked-nested-workspace, large-dirty-baseline, unavailable-diff-artifact, large-plan-over-output-cap, staged-rename, deleted-follow-up-plan, and implicit-deleted-plan cases.
+
 ## 0.28.5
 
+- Added a compatibility alias for stale ChatGPT descriptors that still request `ui://widget/codexpro-tool-card-v8.html`, while keeping `ui://widget/codexpro-tool-card-v9.html` as the current advertised widget.
+- Stopped advertising the `bash` MCP tool when `CODEXPRO_BASH_MODE=off` / `codexpro start --no-bash` is active, so ChatGPT has less opportunity to attempt a shell tool call in no-bash sessions.
+- Stopped advertising direct `write` and `edit` tools unless `CODEXPRO_WRITE_MODE=workspace`; handoff/off modes keep handoff planning tools available for bounded `.ai-bridge` plan files without exposing generic source edit actions.
+- Added smoke coverage that compares `codexpro_self_test` expected tools against the actually registered MCP tool set, so disabled tools cannot silently remain visible in ChatGPT's tool list.
+- Tightened `CODEXPRO_CONTEXT_DIR` to workspace-relative hidden directories such as `.ai-bridge`, rejecting source/build/dependency/credential directories and absolute paths.
+- Made saved profile handling stricter: non-agent modes cannot inherit `write=workspace`, relative tunnel config/token paths resolve from the workspace, and `settings set` refuses to persist raw Cloudflare tunnel tokens.
+- Completed the local admin profile form for named Cloudflare/ngrok settings, including tunnel name, config paths, token-file path, and cloudflared auto-install preference.
 - Fixed path-scoped `show_changes` so unrelated workspace status is not reported for a clean requested path.
 - Kept duplicate `load_skill` matches ambiguous until the caller supplies the exact displayed skill path.
 - Added `codexpro_self_test`, a local-only diagnostic that checks modes, expected tools, safe bash policy, selected-only Pro context, and an optional `.ai-bridge/codexpro-self-test.md` write/edit probe without touching source files.
