@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 
+// Stable protocol identifier consumed by ChatGPT Control. If the derivation
+// changes incompatibly, introduce a new prefix instead of redefining cpb1.
 export const CODEXPRO_BINDING_MARKER_PREFIX = "cpb1_";
 const BINDING_MARKER_DOMAIN = "codexpro-binding-v1:";
 
