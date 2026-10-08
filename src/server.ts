@@ -19,6 +19,7 @@ import { listCodexSessions, readCodexSession, readCodexSessionAround, searchCode
 import { TOOL_CARD_LEGACY_URIS, TOOL_CARD_MIME_TYPE, TOOL_CARD_URI, toolCardWidgetHtml } from "./toolCardWidget.js";
 import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.js";
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
+import { captureScreen, listVisibleWindows } from "./screenCapture.js";
 import { pathRedactions, redactPathsDeep, redactPathsInText } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
 
@@ -367,6 +368,8 @@ const FULL_TOOL_NAMES = [
   "codexpro_self_test",
   "codexpro_inventory",
   "load_skill",
+  "list_windows",
+  "capture_screen",
   "list_workspaces",
   "open_current_workspace",
   "open_workspace",
@@ -400,6 +403,8 @@ const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
   "apply_patch",
   "import_file",
   "bash",
+  "list_windows",
+  "capture_screen",
   "export_pro_context",
   "handoff_to_agent",
   "handoff_to_codex"
@@ -433,6 +438,12 @@ function toolNamesForMode(config: CodexProConfig): string[] {
   if (!config.analysisEnabled) {
     const analysisIndex = names.indexOf("inspect_workspace");
     if (analysisIndex !== -1) names.splice(analysisIndex, 1);
+  }
+  if (!config.screenCapture || process.platform !== "win32") {
+    for (const screenTool of ["list_windows", "capture_screen"]) {
+      const toolIndex = names.indexOf(screenTool);
+      if (toolIndex !== -1) names.splice(toolIndex, 1);
+    }
   }
   if (config.connectionTest) {
     for (const hiddenTool of CONNECTION_TEST_HIDDEN_TOOLS) {
@@ -468,6 +479,7 @@ function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
   if (name === "codex_sessions") return config.codexSessions !== "off";
   if (name === "read_codex_session") return config.codexSessions === "read";
   if (name === "inspect_workspace" && !config.analysisEnabled) return false;
+  if ((name === "list_windows" || name === "capture_screen") && (!config.screenCapture || process.platform !== "win32")) return false;
   if (name === "handoff_to_agent" && config.writeMode === "handoff") return true;
   if (config.toolMode === "full") return true;
   if (config.toolMode === "minimal") return MINIMAL_TOOLS.has(name);
@@ -522,6 +534,9 @@ function serverInstructions(config: CodexProConfig): string {
       : config.bashSessionId
         ? `8. Bash session label for this server is "${config.bashSessionId}".`
         : "",
+    config.screenCapture
+      ? "9. Screen capture is enabled. Use list_windows or capture_screen only when the user explicitly asks to inspect the visible desktop or a window; screenshots and window titles may contain private information."
+      : "",
     "",
     `Current modes: tool=${config.toolMode}, bash=${config.bashMode}, write=${config.writeMode}.`
   ].filter(Boolean).join("\n");
@@ -1084,6 +1099,7 @@ export function createCodexProServer(
         toolMode: config.toolMode,
         exposeAbsolutePaths: config.exposeAbsolutePaths,
         toolCards: config.toolCards,
+        screenCapture: config.screenCapture,
         connectionTest: config.connectionTest,
         analysisEnabled: config.analysisEnabled,
         analysisLimits: config.analysisLimits,
@@ -1104,6 +1120,76 @@ export function createCodexProServer(
         registeredToolCount: registeredToolNames(server).length
       };
       return textResult(`# CodexPro Server Config\n\n${JSON.stringify(safeConfig, null, 2)}`, safeConfig);
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "list_windows",
+    {
+      title: "List Windows",
+      description: "List visible Windows desktop windows with title, process, PID, minimized state, and bounds. Use only when the user explicitly asks to inspect or capture the desktop because window titles may contain private information.",
+      inputSchema: {
+        title: z.string().optional().describe("Optional case-insensitive title substring filter."),
+        process_name: z.string().optional().describe("Optional case-insensitive process-name substring filter."),
+        include_minimized: z.boolean().optional().describe("Include minimized windows. Default: false."),
+        limit: z.number().int().min(1).max(200).optional().describe("Maximum windows to return. Default: 80.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: { ...toolCardMeta(), "openai/toolInvocation/invoking": "Listing visible Windows windows...", "openai/toolInvocation/invoked": "Visible Windows windows listed" }
+    },
+    async (args) => {
+      const windows = await listVisibleWindows({
+        title: typeof args.title === "string" ? args.title : undefined,
+        processName: typeof args.process_name === "string" ? args.process_name : undefined,
+        includeMinimized: parseBool(args.include_minimized, false),
+        limit: limitInt(args.limit, 80, 1, 200)
+      });
+      const lines = windows.length
+        ? windows.map((window, index) => `${index + 1}. PID ${window.pid} | ${window.processName || "unknown"} | ${window.minimized ? "minimized" : "visible"} | ${window.bounds.width}x${window.bounds.height} at ${window.bounds.left},${window.bounds.top} | ${window.title}`)
+        : ["No matching visible windows were found."];
+      return textResult(`# Visible Windows\n\n${lines.join("\n")}`, { platform: process.platform, count: windows.length, windows });
+    }
+  );
+
+  registerCodexTool(
+    config,
+    server,
+    "capture_screen",
+    {
+      title: "Capture Screen",
+      description: "Capture a PNG of the Windows virtual desktop, primary display, one monitor, foreground window, or a visible window selected by PID/process/title. Use only after the user explicitly asks for a screenshot or visual inspection; the image may contain private information. Window capture prefers PrintWindow and falls back to visible screen pixels.",
+      inputSchema: {
+        mode: z.enum(["full", "primary", "monitor", "foreground", "window"]).optional().describe("Capture target. Default: full."),
+        monitor_index: z.number().int().min(0).max(31).optional().describe("Zero-based monitor index when mode=monitor."),
+        pid: z.number().int().min(1).optional().describe("Window process ID when mode=window."),
+        process_name: z.string().optional().describe("Window process-name substring when mode=window."),
+        title: z.string().optional().describe("Window title substring when mode=window."),
+        max_width: z.number().int().min(320).max(4096).optional().describe("Maximum returned PNG width. Default: 1920."),
+        max_height: z.number().int().min(240).max(4096).optional().describe("Maximum returned PNG height. Default: 1200.")
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: { ...toolCardMeta(), "openai/toolInvocation/invoking": "Capturing the Windows screen...", "openai/toolInvocation/invoked": "Windows screenshot captured" }
+    },
+    async (args) => {
+      const mode = typeof args.mode === "string" ? args.mode : "full";
+      const capture = await captureScreen({
+        mode: mode as "full" | "primary" | "monitor" | "foreground" | "window",
+        monitorIndex: typeof args.monitor_index === "number" ? args.monitor_index : undefined,
+        pid: typeof args.pid === "number" ? args.pid : undefined,
+        processName: typeof args.process_name === "string" ? args.process_name : undefined,
+        title: typeof args.title === "string" ? args.title : undefined,
+        maxWidth: typeof args.max_width === "number" ? args.max_width : undefined,
+        maxHeight: typeof args.max_height === "number" ? args.max_height : undefined
+      });
+      return {
+        content: [
+          { type: "image", data: capture.png.toString("base64"), mimeType: "image/png" },
+          { type: "text", text: redactSensitiveText(`Captured ${capture.metadata.mode} screenshot: ${capture.metadata.width}x${capture.metadata.height} PNG (${capture.png.length} bytes), method=${capture.metadata.method}.`) }
+        ],
+        structuredContent: redactStructured({ ...capture.metadata, pngBytes: capture.png.length })
+      };
     }
   );
 

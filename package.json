@@ -81,6 +81,7 @@
     "stress": "npm run build && node scripts/stress.mjs",
     "analysis:smoke": "npm run build && node scripts/analysis-smoke.mjs",
     "analysis:cli-smoke": "npm run build && node scripts/analysis-cli-smoke.mjs",
+    "screen:smoke": "npm run build && node scripts/screen-capture-smoke.mjs && node scripts/screen-mcp-smoke.mjs",
     "doctor": "node scripts/codexpro.mjs doctor",
     "connect": "node scripts/codexpro.mjs",
     "connect:setup": "node scripts/codexpro.mjs setup",
