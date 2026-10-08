@@ -143,7 +143,7 @@ async function filesForGlobs(
     const matches = await listFiles(guard, workspace, {
       root: ".",
       glob,
-      includeHidden: false,
+      includeHidden: /(^|\/)\./.test(glob),
       maxFiles: Math.max(1, maxFiles - out.length)
     });
     out.push(...matches);
@@ -181,9 +181,13 @@ export async function buildProContext(
   const changedFileCandidates = includeChangedFiles ? changedFiles : [];
   const selectedPaths = unique(options.selectedPaths ?? []);
   const extraGlobFiles = await filesForGlobs(guard, workspace, options.extraGlobs ?? [], maxFiles);
-  const candidates = unique([...importantFiles, ...changedFileCandidates, ...selectedPaths, ...extraGlobFiles])
+  const selectedSet = new Set(selectedPaths);
+  const candidates = unique([...selectedPaths, ...changedFileCandidates, ...importantFiles, ...extraGlobFiles])
     .filter((rel) => rel !== `${config.contextDir}/pro-context.md`)
     .sort((a, b) => {
+      const aSelected = selectedSet.has(a) ? 0 : 1;
+      const bSelected = selectedSet.has(b) ? 0 : 1;
+      if (aSelected !== bSelected) return aSelected - bSelected;
       const aImportant = isLikelyImportantConfig(a) ? 0 : 1;
       const bImportant = isLikelyImportantConfig(b) ? 0 : 1;
       if (aImportant !== bImportant) return aImportant - bImportant;
@@ -304,9 +308,13 @@ export async function exportProContext(
   workspace: Workspace,
   options: ProContextOptions = {}
 ): Promise<ProContextResult> {
-  await ensureAiBridge(config, guard, workspace);
+  if (options.includeAiBridge !== false) {
+    await ensureAiBridge(config, guard, workspace);
+  }
   const built = await buildProContext(config, guard, workspace, options);
   built.markdown = redactSensitiveText(built.markdown);
+  const contextDir = guard.resolve(workspace, config.contextDir, { forWrite: true });
+  await fsp.mkdir(contextDir.absPath, { recursive: true, mode: 0o700 });
   const relPath = `${config.contextDir}/pro-context.md`;
   const write = await writeTextFile(config, guard, workspace, relPath, built.markdown, {
     createDirs: true,

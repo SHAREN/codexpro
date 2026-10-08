@@ -1,8 +1,7 @@
-import { createReadStream, statSync, type Dirent } from "node:fs";
+import { type Dirent } from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createInterface } from "node:readline";
 import type { CodexProConfig } from "./config.js";
 import { CodexProError } from "./guard.js";
 
@@ -41,8 +40,59 @@ export interface CodexSessionReadResult {
   session: CodexSessionMeta;
   messages: CodexSessionMessage[];
   truncated: boolean;
+  direction: "head" | "tail";
+  cursor: number;
+  resume_cursor: number;
+  next_cursor?: number;
+  has_more: boolean;
+  source_size_bytes: number;
   text: string;
 }
+
+export interface CodexSessionSearchMatch {
+  message_id: string;
+  byte_offset: number;
+  role: string;
+  snippet: string;
+  ts?: number;
+  tool_name?: string;
+}
+
+export interface CodexSessionSearchResult {
+  session: CodexSessionMeta;
+  matches: CodexSessionSearchMatch[];
+  truncated: boolean;
+  source_size_bytes: number;
+  text: string;
+}
+
+export interface CodexSessionAroundResult {
+  session: CodexSessionMeta;
+  messages: CodexSessionMessage[];
+  target: { message_id: string; byte_offset: number; ts?: number };
+  before: number;
+  after: number;
+  has_more_before: boolean;
+  has_more_after: boolean;
+  truncated: boolean;
+  source_size_bytes: number;
+  text: string;
+}
+
+interface JsonlLine {
+  line: string;
+  start: number;
+  end: number;
+}
+
+interface SessionMessageRecord {
+  message: CodexSessionMessage;
+  start: number;
+  end: number;
+}
+
+const SESSION_READ_BLOCK_BYTES = 64 * 1024;
+const DEFAULT_TOOL_OUTPUT_BYTES = 20_000;
 
 function codexDir(config: CodexProConfig): string {
   return path.resolve(config.codexDir || path.join(os.homedir(), ".codex"));
@@ -242,16 +292,11 @@ async function parseSessionMeta(filePath: string): Promise<CodexSessionMeta | un
   }
 
   let lastActiveAt: number | undefined;
-  let summary: string | undefined;
   for (const line of [...tail].reverse()) {
     const value = parseJsonLine(line);
     if (!value) continue;
     lastActiveAt ??= parseTimestamp(value.timestamp);
-    if (!summary && value.type === "response_item" && value.payload?.type === "message") {
-      const text = extractText(value.payload.content);
-      if (text.trim()) summary = text;
-    }
-    if (lastActiveAt && summary) break;
+    if (lastActiveAt) break;
   }
 
   const id = String(sessionId || inferSessionIdFromFilename(filePath) || "").trim();
@@ -262,7 +307,6 @@ async function parseSessionMeta(filePath: string): Promise<CodexSessionMeta | un
     provider_id: "codex",
     session_id: id,
     ...(title ? { title } : {}),
-    ...(summary ? { summary: truncate(summary, 180) } : {}),
     ...(projectDir ? { project_dir: projectDir } : {}),
     ...(createdAt ? { created_at: createdAt } : {}),
     ...(lastActiveAt ? { last_active_at: lastActiveAt } : {}),
@@ -279,7 +323,7 @@ async function collectSessionMetas(config: CodexProConfig): Promise<CodexSession
 
   const sessions: CodexSessionMeta[] = [];
   for (const file of files) {
-    const meta = await parseSessionMeta(file);
+    const meta = await parseSessionMeta(file).catch(() => undefined);
     if (meta) sessions.push(meta);
   }
   return sessions;
@@ -298,7 +342,6 @@ export async function listCodexSessions(
     ? sessions.filter((session) => [
         session.session_id,
         session.title,
-        session.summary,
         session.project_dir,
         session.source_path
       ].filter(Boolean).join("\n").toLowerCase().includes(query))
@@ -316,7 +359,7 @@ export async function listCodexSessions(
 
 async function resolveSessionSource(config: CodexProConfig, sessionId?: string, sourcePath?: string): Promise<CodexSessionMeta> {
   ensureEnabled(config, true);
-  const roots = sessionRoots(config).map((root) => path.resolve(root));
+  const roots = await Promise.all(sessionRoots(config).map(async (root) => fsp.realpath(root).catch(() => path.resolve(root))));
 
   if (sourcePath) {
     const resolved = path.resolve(sourcePath);
@@ -337,57 +380,503 @@ async function resolveSessionSource(config: CodexProConfig, sessionId?: string, 
   return match;
 }
 
-async function loadSessionMessages(filePath: string, maxMessages: number, maxTotalBytes: number): Promise<{ messages: CodexSessionMessage[]; truncated: boolean }> {
-  const size = statSync(filePath).size;
-  if (size > 20_000_000) {
-    throw new CodexProError(`Codex session file is too large (${size} bytes).`);
+function clampCursor(value: number | undefined, size: number, direction: "head" | "tail"): number {
+  if (value === undefined) return direction === "tail" ? size : 0;
+  if (!Number.isInteger(value) || value < 0) {
+    throw new CodexProError("cursor must be a non-negative integer byte offset returned by a previous read_codex_session call.");
   }
+  if (value > size) {
+    throw new CodexProError("cursor is beyond the current Codex session file. The source may have been truncated or replaced; restart pagination without a cursor.");
+  }
+  return value;
+}
 
-  const messages: CodexSessionMessage[] = [];
-  let usedBytes = 0;
-  let truncated = false;
-  const rl = createInterface({ input: createReadStream(filePath, { encoding: "utf8" }), crlfDelay: Infinity });
-
-  for await (const line of rl) {
-    const value = parseJsonLine(line);
-    if (value?.type !== "response_item" || !value.payload) continue;
-    const payload = value.payload;
-    let role = "";
-    let content = "";
-    if (payload.type === "message") {
-      role = String(payload.role || "unknown");
-      content = extractText(payload.content);
-    } else if (payload.type === "function_call") {
-      role = "assistant";
-      content = `[Tool: ${payload.name || "unknown"}]`;
-    } else if (payload.type === "function_call_output") {
-      role = "tool";
-      content = String(payload.output || "");
-    } else {
-      continue;
+async function* readJsonlLinesFromHead(filePath: string, startOffset: number, endOffset: number): AsyncGenerator<JsonlLine> {
+  const handle = await fsp.open(filePath, "r");
+  try {
+    let position = startOffset;
+    let pending: Buffer[] = [];
+    let pendingStart = startOffset;
+    while (position < endOffset) {
+      const length = Math.min(SESSION_READ_BLOCK_BYTES, endOffset - position);
+      const chunk = Buffer.alloc(length);
+      const { bytesRead } = await handle.read(chunk, 0, length, position);
+      if (!bytesRead) break;
+      const current = chunk.subarray(0, bytesRead);
+      let lineStart = 0;
+      while (true) {
+        const newline = current.indexOf(0x0a, lineStart);
+        if (newline === -1) break;
+        const segment = current.subarray(lineStart, newline);
+        const line = pending.length ? Buffer.concat([...pending, segment]) : segment;
+        yield {
+          line: line.toString("utf8"),
+          start: pendingStart,
+          end: position + newline + 1
+        };
+        pending = [];
+        lineStart = newline + 1;
+        pendingStart = position + lineStart;
+      }
+      const remainder = current.subarray(lineStart);
+      if (remainder.length) pending.push(remainder);
+      position += bytesRead;
     }
-    if (!content.trim()) continue;
-    const nextBytes = Buffer.byteLength(content, "utf8");
-    if (messages.length >= maxMessages || usedBytes + nextBytes > maxTotalBytes) {
+    if (pending.length) {
+      const line = Buffer.concat(pending);
+      yield { line: line.toString("utf8"), start: pendingStart, end: pendingStart + line.length };
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+async function* readJsonlLinesFromTail(filePath: string, endOffset: number): AsyncGenerator<JsonlLine> {
+  const handle = await fsp.open(filePath, "r");
+  try {
+    let position = endOffset;
+    let pending: Buffer[] = [];
+    let pendingEnd = endOffset;
+    while (position > 0) {
+      const start = Math.max(0, position - SESSION_READ_BLOCK_BYTES);
+      const length = position - start;
+      const chunk = Buffer.alloc(length);
+      const { bytesRead } = await handle.read(chunk, 0, length, start);
+      if (!bytesRead) break;
+      const current = chunk.subarray(0, bytesRead);
+      let lineEnd = current.length;
+      while (true) {
+        const newline = current.lastIndexOf(0x0a, lineEnd - 1);
+        if (newline === -1) break;
+        const lineStart = newline + 1;
+        const segment = current.subarray(lineStart, lineEnd);
+        const line = pending.length
+          ? Buffer.concat([segment, ...pending.slice().reverse()])
+          : segment;
+        if (line.length) {
+          yield { line: line.toString("utf8"), start: start + lineStart, end: pendingEnd };
+        }
+        pending = [];
+        pendingEnd = start + newline;
+        lineEnd = newline;
+      }
+      const remainder = current.subarray(0, lineEnd);
+      if (remainder.length) pending.push(remainder);
+      position = start;
+    }
+    if (pending.length) {
+      const line = Buffer.concat(pending.slice().reverse());
+      yield { line: line.toString("utf8"), start: 0, end: pendingEnd };
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+function truncateUtf8(text: string, maxBytes: number, suffix = "…"): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  const suffixBytes = Buffer.byteLength(suffix, "utf8");
+  const fittedSuffix = suffixBytes <= maxBytes ? suffix : "";
+  const bodyBudget = maxBytes - Buffer.byteLength(fittedSuffix, "utf8");
+  let usedBytes = 0;
+  let body = "";
+  for (const character of text) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (usedBytes + characterBytes > bodyBudget) break;
+    body += character;
+    usedBytes += characterBytes;
+  }
+  return `${body}${fittedSuffix}`;
+}
+
+function boundedToolOutput(output: unknown, maxBytes: number): string {
+  const content = String(output || "");
+  if (Buffer.byteLength(content, "utf8") <= maxBytes) return content;
+  if (maxBytes <= 0) return "";
+  const marker = "\n[Tool output truncated]";
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  if (markerBytes >= maxBytes) return truncateUtf8(content, maxBytes, "");
+  return `${truncateUtf8(content, maxBytes - markerBytes, "")}${marker}`;
+}
+
+function messageFromJsonlLine(
+  line: string,
+  options: { excludeToolOutputs: boolean; maxToolOutputBytes: number }
+): CodexSessionMessage | undefined {
+  const value = parseJsonLine(line);
+  if (value?.type !== "response_item" || !value.payload) return undefined;
+  const payload = value.payload;
+  let role = "";
+  let content = "";
+  if (payload.type === "message") {
+    role = String(payload.role || "unknown");
+    content = extractText(payload.content);
+  } else if (payload.type === "function_call") {
+    role = "assistant";
+    content = `[Tool: ${payload.name || "unknown"}]`;
+  } else if (payload.type === "function_call_output") {
+    if (options.excludeToolOutputs) return undefined;
+    role = "tool";
+    content = boundedToolOutput(payload.output, options.maxToolOutputBytes);
+  } else {
+    return undefined;
+  }
+  if (!content.trim()) return undefined;
+  const ts = parseTimestamp(value.timestamp);
+  return { role, content, ...(ts !== undefined ? { ts } : {}) };
+}
+
+function messageDetailsFromJsonlLine(
+  line: string,
+  options: { excludeToolOutputs: boolean; maxToolOutputBytes: number }
+): { message: CodexSessionMessage; toolName?: string } | undefined {
+  const value = parseJsonLine(line);
+  if (value?.type !== "response_item" || !value.payload) return undefined;
+  const message = messageFromJsonlLine(line, options);
+  if (!message) return undefined;
+  return {
+    message,
+    ...(value.payload.type === "function_call" && value.payload.name ? { toolName: String(value.payload.name) } : {})
+  };
+}
+
+function timestampBound(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function snippetAround(text: string, query: string, maxChars: number): string {
+  const clean = text.replace(/\s+/g, " ").trim();
+  if (clean.length <= maxChars) return clean;
+  const matchIndex = clean.toLocaleLowerCase().indexOf(query.toLocaleLowerCase());
+  if (matchIndex < 0) return truncate(clean, maxChars);
+  const radius = Math.max(20, Math.floor((maxChars - query.length) / 2));
+  const start = Math.max(0, matchIndex - radius);
+  const end = Math.min(clean.length, matchIndex + query.length + radius);
+  const prefix = start > 0 ? "…" : "";
+  const suffix = end < clean.length ? "…" : "";
+  return `${prefix}${clean.slice(start, end).trim()}${suffix}`.slice(0, maxChars);
+}
+
+export async function searchCodexSession(
+  config: CodexProConfig,
+  options: {
+    sessionId?: string;
+    sourcePath?: string;
+    query: string;
+    roles?: string[];
+    toolNames?: string[];
+    timeFrom?: string | number;
+    timeTo?: string | number;
+    maxResults?: number;
+    maxSnippetBytes?: number;
+  }
+): Promise<CodexSessionSearchResult> {
+  const session = await resolveSessionSource(config, options.sessionId, options.sourcePath);
+  const query = options.query.trim();
+  if (!query) throw new CodexProError("query is required.");
+  const sourceSizeBytes = (await fsp.stat(session.source_path)).size;
+  const allowedRoles = new Set((options.roles ?? []).map((role) => role.trim().toLowerCase()).filter(Boolean));
+  const allowedTools = new Set((options.toolNames ?? []).map((tool) => tool.trim().toLowerCase()).filter(Boolean));
+  const from = timestampBound(options.timeFrom);
+  const to = timestampBound(options.timeTo);
+  const maxResults = Math.max(1, Math.min(Number(options.maxResults ?? 30), 100));
+  const maxSnippetBytes = Math.max(80, Math.min(Number(options.maxSnippetBytes ?? 600), 4_000));
+  const matches: CodexSessionSearchMatch[] = [];
+  let truncated = false;
+  for await (const line of readJsonlLinesFromHead(session.source_path, 0, sourceSizeBytes)) {
+    const details = messageDetailsFromJsonlLine(line.line, { excludeToolOutputs: false, maxToolOutputBytes: 12_000 });
+    if (!details) continue;
+    const { message, toolName } = details;
+    if (allowedRoles.size && !allowedRoles.has(message.role.toLowerCase())) continue;
+    if (allowedTools.size && (!toolName || !allowedTools.has(toolName.toLowerCase()))) continue;
+    if (from !== undefined && (message.ts === undefined || message.ts < from)) continue;
+    if (to !== undefined && (message.ts === undefined || message.ts > to)) continue;
+    if (!message.content.toLocaleLowerCase().includes(query.toLocaleLowerCase())) continue;
+    if (matches.length >= maxResults) {
       truncated = true;
       break;
     }
-    usedBytes += nextBytes;
-    const ts = parseTimestamp(value.timestamp);
-    messages.push({ role, content, ...(ts !== undefined ? { ts } : {}) });
+    matches.push({
+      message_id: String(line.start),
+      byte_offset: line.start,
+      role: message.role,
+      snippet: snippetAround(message.content, query, maxSnippetBytes),
+      ...(message.ts !== undefined ? { ts: message.ts } : {}),
+      ...(toolName ? { tool_name: toolName } : {})
+    });
+  }
+  const rows = matches.length
+    ? matches.map((match) => `- ${match.message_id} ${match.role}${match.tool_name ? ` [${match.tool_name}]` : ""}: ${match.snippet}`).join("\n")
+    : "- No matching messages.";
+  const text = [
+    "# Search Codex Session",
+    "",
+    `Session: ${session.session_id}`,
+    `Query: ${query}`,
+    `Matches: ${matches.length}${truncated ? "+" : ""}`,
+    "",
+    rows
+  ].join("\n");
+  return { session, matches, truncated, source_size_bytes: sourceSizeBytes, text };
+}
+
+async function targetOffsetForSession(
+  filePath: string,
+  options: { messageId?: string; byteOffset?: number; timestamp?: string | number }
+): Promise<{ offset: number; ts?: number }> {
+  if (options.byteOffset !== undefined) {
+    if (!Number.isInteger(options.byteOffset) || options.byteOffset < 0) throw new CodexProError("byte_offset must be a non-negative integer.");
+    return { offset: options.byteOffset };
+  }
+  if (options.messageId?.trim()) {
+    const offset = Number(options.messageId);
+    if (!Number.isInteger(offset) || offset < 0) throw new CodexProError("message_id must be the byte offset returned by search_codex_session.");
+    return { offset };
+  }
+  const targetTs = timestampBound(options.timestamp);
+  if (targetTs === undefined) throw new CodexProError("message_id, byte_offset, or timestamp is required.");
+  const size = (await fsp.stat(filePath)).size;
+  for await (const line of readJsonlLinesFromHead(filePath, 0, size)) {
+    const details = messageDetailsFromJsonlLine(line.line, { excludeToolOutputs: false, maxToolOutputBytes: 1_000 });
+    if (details?.message.ts !== undefined && details.message.ts >= targetTs) return { offset: line.start, ts: details.message.ts };
+  }
+  throw new CodexProError("No transcript message matched the requested timestamp.");
+}
+
+async function loadSessionMessagesAround(
+  filePath: string,
+  targetOffset: number,
+  options: { before: number; after: number; maxTotalBytes: number; excludeToolOutputs: boolean; maxToolOutputBytes: number }
+): Promise<{ messages: CodexSessionMessage[]; target: { offset: number; ts?: number }; hasMoreBefore: boolean; hasMoreAfter: boolean; truncated: boolean; sourceSizeBytes: number }> {
+  const sourceSizeBytes = (await fsp.stat(filePath)).size;
+  if (targetOffset > sourceSizeBytes) throw new CodexProError("byte offset is beyond the current Codex session file.");
+  const beforeRecords: SessionMessageRecord[] = [];
+  const selected: SessionMessageRecord[] = [];
+  let found = false;
+  let afterCount = 0;
+  let hasMoreBefore = false;
+  let hasMoreAfter = false;
+  let targetTs: number | undefined;
+  for await (const line of readJsonlLinesFromHead(filePath, 0, sourceSizeBytes)) {
+    const parsed = messageDetailsFromJsonlLine(line.line, options);
+    if (!parsed) continue;
+    const record = { message: parsed.message, start: line.start, end: line.end };
+    if (!found) {
+      if (line.start <= targetOffset && targetOffset < line.end) {
+        found = true;
+        targetTs = parsed.message.ts;
+        selected.push(record);
+        continue;
+      }
+      beforeRecords.push(record);
+      if (beforeRecords.length > options.before) {
+        beforeRecords.shift();
+        hasMoreBefore = true;
+      }
+      continue;
+    }
+    if (afterCount < options.after) {
+      selected.push(record);
+      afterCount += 1;
+    } else {
+      hasMoreAfter = true;
+      break;
+    }
+  }
+  if (!found) throw new CodexProError("No transcript message matched the requested message_id or byte_offset.");
+  const orderedRecords = selected.length
+    ? [selected[0], ...beforeRecords.slice().reverse(), ...selected.slice(1)]
+    : [];
+  const accepted = new Map<number, CodexSessionMessage>();
+  let usedBytes = 0;
+  let truncated = false;
+  for (const record of orderedRecords) {
+    const message = record.message;
+    const remaining = options.maxTotalBytes - usedBytes;
+    if (remaining <= 0) {
+      truncated = true;
+      break;
+    }
+    const contentBytes = Buffer.byteLength(message.content, "utf8");
+    const bounded = contentBytes > remaining ? { ...message, content: truncateUtf8(message.content, remaining) } : message;
+    if (!bounded.content) {
+      truncated = true;
+      break;
+    }
+    accepted.set(record.start, bounded);
+    usedBytes += Buffer.byteLength(bounded.content, "utf8");
+    if (contentBytes > remaining) {
+      truncated = true;
+      break;
+    }
+  }
+  const messages = [...accepted.entries()].sort(([left], [right]) => left - right).map(([, message]) => message);
+  return {
+    messages,
+    target: { offset: targetOffset, ...(targetTs !== undefined ? { ts: targetTs } : {}) },
+    hasMoreBefore,
+    hasMoreAfter,
+    truncated,
+    sourceSizeBytes
+  };
+}
+
+function transcriptText(session: CodexSessionMeta, messages: CodexSessionMessage[], heading: string): string {
+  const transcript = messages.map((message) => {
+    const when = message.ts ? ` ${new Date(message.ts).toISOString()}` : "";
+    return `### ${message.role}${when}\n\n${message.content}`;
+  }).join("\n\n");
+  return [
+    `# ${heading}`,
+    "",
+    `Session: ${session.session_id}`,
+    session.title ? `Title: ${session.title}` : "",
+    session.project_dir ? `CWD: ${session.project_dir}` : "",
+    `Source: ${session.source_path}`,
+    "",
+    "## Transcript",
+    "",
+    transcript || "No readable transcript messages found."
+  ].filter((line) => line !== "").join("\n");
+}
+
+export async function readCodexSessionAround(
+  config: CodexProConfig,
+  options: {
+    sessionId?: string;
+    sourcePath?: string;
+    messageId?: string;
+    byteOffset?: number;
+    timestamp?: string | number;
+    before?: number;
+    after?: number;
+    maxTotalBytes?: number;
+    excludeToolOutputs?: boolean;
+    maxToolOutputBytes?: number;
+  }
+): Promise<CodexSessionAroundResult> {
+  const session = await resolveSessionSource(config, options.sessionId, options.sourcePath);
+  const target = await targetOffsetForSession(session.source_path, options);
+  const before = Math.max(0, Math.min(Number(options.before ?? 10), 100));
+  const after = Math.max(0, Math.min(Number(options.after ?? 10), 100));
+  const maxTotalBytes = Math.max(4_000, Math.min(Number(options.maxTotalBytes ?? 80_000), 400_000));
+  const maxToolOutputBytes = Math.max(0, Math.min(Number(options.maxToolOutputBytes ?? DEFAULT_TOOL_OUTPUT_BYTES), 400_000));
+  const result = await loadSessionMessagesAround(session.source_path, target.offset, {
+    before,
+    after,
+    maxTotalBytes,
+    excludeToolOutputs: options.excludeToolOutputs === true,
+    maxToolOutputBytes
+  });
+  return {
+    session,
+    messages: result.messages,
+    target: {
+      message_id: String(result.target.offset),
+      byte_offset: result.target.offset,
+      ...(result.target.ts !== undefined ? { ts: result.target.ts } : {})
+    },
+    before,
+    after,
+    has_more_before: result.hasMoreBefore,
+    has_more_after: result.hasMoreAfter,
+    truncated: result.truncated,
+    source_size_bytes: result.sourceSizeBytes,
+    text: transcriptText(session, result.messages, "Read Around Codex Session")
+  };
+}
+
+async function loadSessionMessages(
+  filePath: string,
+  options: {
+    direction: "head" | "tail";
+    cursor?: number;
+    maxMessages: number;
+    maxTotalBytes: number;
+    excludeToolOutputs: boolean;
+    maxToolOutputBytes: number;
+  }
+): Promise<{ messages: CodexSessionMessage[]; truncated: boolean; cursor: number; resumeCursor: number; nextCursor?: number; hasMore: boolean; sourceSizeBytes: number }> {
+  const sourceSizeBytes = (await fsp.stat(filePath)).size;
+  const cursor = clampCursor(options.cursor, sourceSizeBytes, options.direction);
+  const lines = options.direction === "tail"
+    ? readJsonlLinesFromTail(filePath, cursor)
+    : readJsonlLinesFromHead(filePath, cursor, sourceSizeBytes);
+  const records: SessionMessageRecord[] = [];
+  let usedBytes = 0;
+  let truncated = false;
+  let hasMore = false;
+
+  for await (const line of lines) {
+    const parsed = messageFromJsonlLine(line.line, options);
+    if (!parsed) continue;
+    if (records.length >= options.maxMessages || usedBytes >= options.maxTotalBytes) {
+      truncated = true;
+      hasMore = true;
+      break;
+    }
+    const remainingBytes = options.maxTotalBytes - usedBytes;
+    const contentBytes = Buffer.byteLength(parsed.content, "utf8");
+    const message = contentBytes > remainingBytes
+      ? { ...parsed, content: truncateUtf8(parsed.content, remainingBytes) }
+      : parsed;
+    if (!message.content) {
+      truncated = true;
+      hasMore = true;
+      break;
+    }
+    if (contentBytes > remainingBytes) truncated = true;
+    usedBytes += Buffer.byteLength(message.content, "utf8");
+    records.push({ message, start: line.start, end: line.end });
   }
 
-  return { messages, truncated };
+  const ordered = options.direction === "tail" ? records.reverse() : records;
+  const resumeCursor = records.length
+    ? options.direction === "tail"
+      ? Math.min(...records.map((record) => record.start))
+      : Math.max(...records.map((record) => record.end))
+    : cursor;
+  return {
+    messages: ordered.map((record) => record.message),
+    truncated,
+    cursor,
+    resumeCursor,
+    ...(hasMore ? { nextCursor: resumeCursor } : {}),
+    hasMore,
+    sourceSizeBytes
+  };
 }
 
 export async function readCodexSession(
   config: CodexProConfig,
-  options: { sessionId?: string; sourcePath?: string; maxMessages?: number; maxTotalBytes?: number } = {}
+  options: {
+    sessionId?: string;
+    sourcePath?: string;
+    direction?: "head" | "tail";
+    cursor?: number;
+    maxMessages?: number;
+    maxTotalBytes?: number;
+    excludeToolOutputs?: boolean;
+    maxToolOutputBytes?: number;
+  } = {}
 ): Promise<CodexSessionReadResult> {
   const session = await resolveSessionSource(config, options.sessionId, options.sourcePath);
+  const direction = options.direction === "head" ? "head" : "tail";
   const maxMessages = Math.max(1, Math.min(Number(options.maxMessages ?? 80), 400));
   const maxTotalBytes = Math.max(4_000, Math.min(Number(options.maxTotalBytes ?? 80_000), 400_000));
-  const { messages, truncated } = await loadSessionMessages(session.source_path, maxMessages, maxTotalBytes);
+  const maxToolOutputBytes = Math.max(0, Math.min(Number(options.maxToolOutputBytes ?? DEFAULT_TOOL_OUTPUT_BYTES), 400_000));
+  const { messages, truncated, cursor, resumeCursor, nextCursor, hasMore, sourceSizeBytes } = await loadSessionMessages(session.source_path, {
+    direction,
+    cursor: options.cursor,
+    maxMessages,
+    maxTotalBytes,
+    excludeToolOutputs: options.excludeToolOutputs === true,
+    maxToolOutputBytes
+  });
   const transcript = messages.map((message) => {
     const when = message.ts ? ` ${new Date(message.ts).toISOString()}` : "";
     return `### ${message.role}${when}\n\n${message.content}`;
@@ -399,6 +888,10 @@ export async function readCodexSession(
     session.title ? `Title: ${session.title}` : "",
     session.project_dir ? `CWD: ${session.project_dir}` : "",
     `Source: ${session.source_path}`,
+    `Direction: ${direction}`,
+    `Cursor: ${cursor}`,
+    `Resume cursor: ${resumeCursor}`,
+    hasMore && nextCursor !== undefined ? `Next cursor: ${nextCursor}` : "",
     `Resume: ${session.resume_command}`,
     truncated ? "Transcript truncated by configured limits." : "",
     "",
@@ -406,5 +899,16 @@ export async function readCodexSession(
     "",
     transcript || "No readable transcript messages found."
   ].filter((line) => line !== "").join("\n");
-  return { session, messages, truncated, text };
+  return {
+    session,
+    messages,
+    truncated,
+    direction,
+    cursor,
+    resume_cursor: resumeCursor,
+    ...(nextCursor !== undefined ? { next_cursor: nextCursor } : {}),
+    has_more: hasMore,
+    source_size_bytes: sourceSizeBytes,
+    text
+  };
 }

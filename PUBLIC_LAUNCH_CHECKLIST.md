@@ -3,7 +3,7 @@
 CodexPro is a local developer bridge. Treat public launch readiness as two separate gates:
 
 1. The npm package is safe and understandable for local developers.
-2. The ChatGPT app surface is stable enough for users to connect through Developer Mode.
+2. The ChatGPT Plugins surface is stable enough for users to connect a Server URL.
 
 Do not present CodexPro as a fully reviewed public ChatGPT app until it has gone through the current app review flow.
 
@@ -17,7 +17,10 @@ npm run build
 npm run smoke
 npm pack --dry-run
 codexpro doctor --tunnel none
+npm view codexpro version dist-tags --json
 ```
+
+After publishing, do not announce npm availability until the `latest` dist-tag matches `package.json`.
 
 The tarball must not include:
 
@@ -35,10 +38,10 @@ local screenshots or reports
 
 Before announcing broadly:
 
-- Test in ChatGPT Developer Mode with a fresh app install.
+- Test in ChatGPT Plugins with a fresh plugin install.
 - Test quick tunnel, saved ngrok domain, and local-only mode.
 - Refresh actions after widget URI or metadata changes.
-- Confirm CSP stays enabled in Developer Mode.
+- Confirm CSP stays enabled (Developer mode prerequisite).
 - Capture screenshots for:
   - app connection screen
   - `server_config`
