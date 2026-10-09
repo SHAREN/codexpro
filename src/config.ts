@@ -45,6 +45,7 @@ export interface CodexProConfig {
   blockedGlobs: string[];
   contextDir: string;
   toolCards: boolean;
+  screenCapture: boolean;
   connectionTest: boolean;
   analysisEnabled: boolean;
   analysisLimits: AnalysisLimits;
@@ -365,6 +366,7 @@ export function loadConfig(argv = process.argv.slice(2)): CodexProConfig {
     blockedGlobs: [...DEFAULT_BLOCKED_GLOBS, ...extraBlockedGlobs],
     contextDir: contextDirFrom(process.env.CODEXPRO_CONTEXT_DIR),
     toolCards: boolFrom(toolCardsArg ?? process.env.CODEXPRO_TOOL_CARDS, false),
+    screenCapture: boolFrom(process.env.CODEXPRO_SCREEN_CAPTURE, false),
     connectionTest: boolFrom(process.env.CODEXPRO_CONNECTION_TEST, false),
     analysisEnabled: boolFrom(process.env.CODEXPRO_ANALYSIS, true),
     analysisLimits: {
