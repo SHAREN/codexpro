@@ -204,4 +204,5 @@ npm run release:publish
 - [Roadmap](ROADMAP.md)
 - [Stable URL guide](DOMAIN_SETUP.md)
 - [Changelog](CHANGELOG.md)
+- [ChatGPT Control / Threads integration](docs/chatgpt-control-integration.md) *(SHAREN fork)*
 - [Contributors](CONTRIBUTORS.md)
