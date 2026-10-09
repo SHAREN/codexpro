@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-import { randomUUID } from "node:crypto";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
@@ -20,6 +19,7 @@ import {
 } from "./profileStore.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
 import { createCodexProServer } from "./server.js";
+import { runWithMcpRequestContext, type McpRequestContext } from "./requestContext.js";
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -1569,6 +1569,50 @@ async function main(): Promise<void> {
     return Array.isArray(value) ? value[0] : value;
   }
 
+  function correlationFingerprint(value: string): string {
+    return createHash("sha256").update(value).digest("hex").slice(0, 16);
+  }
+
+  function clientCorrelationHeaders(req: Request): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [rawName, rawValue] of Object.entries(req.headers)) {
+      const name = rawName.toLowerCase();
+      if (name === "mcp-session-id" || name === "x-openai-subject") continue;
+      if (/authorization|cookie|token|secret|api[-_]?key/i.test(name)) continue;
+      if (!/(request|trace|session|conversation|thread|openai|chatgpt)/i.test(name)) continue;
+      const value = Array.isArray(rawValue) ? rawValue[0] : rawValue;
+      if (typeof value !== "string" || !value) continue;
+      out[name + "-fingerprint"] = correlationFingerprint(redactSensitiveText(value.slice(0, 512)));
+    }
+    return out;
+  }
+
+  function jsonRpcCorrelation(body: unknown): Pick<McpRequestContext, "jsonRpcId" | "jsonRpcMethod" | "requestedTool"> {
+    if (!body || typeof body !== "object" || Array.isArray(body)) return {};
+    const value = body as Record<string, unknown>;
+    const id = value.id;
+    const method = typeof value.method === "string" ? value.method : undefined;
+    const params = value.params && typeof value.params === "object" && !Array.isArray(value.params)
+      ? value.params as Record<string, unknown>
+      : undefined;
+    const requestedTool = method === "tools/call" && typeof params?.name === "string" ? params.name : undefined;
+    return {
+      ...(typeof id === "string" || typeof id === "number" || id === null ? { jsonRpcId: id } : {}),
+      ...(method ? { jsonRpcMethod: method } : {}),
+      ...(requestedTool ? { requestedTool } : {})
+    };
+  }
+
+  function mcpRequestContext(req: Request, body: unknown, sessionId: string | undefined): McpRequestContext {
+    return {
+      requestId: randomUUID(),
+      receivedAt: Date.now(),
+      ...(sessionId ? { mcpSessionId: sessionId } : {}),
+      ...jsonRpcCorrelation(body),
+      clientCorrelation: clientCorrelationHeaders(req)
+    };
+  }
+
   function sendSessionError(res: Response, sessionId: string | undefined): void {
     const missing = !sessionId;
     const malformed = Boolean(sessionId && !sessionIdPattern.test(sessionId));
@@ -1673,8 +1717,9 @@ async function main(): Promise<void> {
   });
 
   app.post("/mcp", express.json({ limit: "20mb" }), async (req, res) => {
+    const sessionId = requestSessionId(req);
+    const context = mcpRequestContext(req, req.body, sessionId);
     try {
-      const sessionId = requestSessionId(req);
       let transport: StreamableHTTPServerTransport;
 
       const existingTransport = getTransport(sessionId);
@@ -1706,7 +1751,7 @@ async function main(): Promise<void> {
         return;
       }
 
-      await transport.handleRequest(req, res, req.body);
+      await runWithMcpRequestContext(context, () => transport.handleRequest(req, res, req.body));
     } catch (error) {
       console.error(error instanceof Error ? error.stack ?? error.message : String(error));
       if (!res.headersSent) {
