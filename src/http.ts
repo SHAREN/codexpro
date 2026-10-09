@@ -1603,13 +1603,38 @@ async function main(): Promise<void> {
     };
   }
 
+  function jsonRpcOpenAiSessionFingerprint(body: unknown): string | undefined {
+    if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+    const value = body as Record<string, unknown>;
+    const params = value.params && typeof value.params === "object" && !Array.isArray(value.params)
+      ? value.params as Record<string, unknown>
+      : undefined;
+    const meta = params?._meta && typeof params._meta === "object" && !Array.isArray(params._meta)
+      ? params._meta as Record<string, unknown>
+      : undefined;
+    const rawSession = meta?.["openai/" + "session"];
+    if (typeof rawSession !== "string" || !rawSession.trim()) return undefined;
+    return correlationFingerprint(rawSession.slice(0, 4096));
+  }
+
   function mcpRequestContext(req: Request, body: unknown, sessionId: string | undefined): McpRequestContext {
+    const clientCorrelation = clientCorrelationHeaders(req);
+    const metaFingerprint = jsonRpcOpenAiSessionFingerprint(body);
+    const headerFingerprint = clientCorrelation["x-openai-session-fingerprint"];
+    if (metaFingerprint) {
+      if (headerFingerprint && headerFingerprint !== metaFingerprint) {
+        delete clientCorrelation["x-openai-session-fingerprint"];
+        clientCorrelation["x-openai-session-conflict"] = "1";
+      } else if (!headerFingerprint) {
+        clientCorrelation["x-openai-session-fingerprint"] = metaFingerprint;
+      }
+    }
     return {
       requestId: randomUUID(),
       receivedAt: Date.now(),
       ...(sessionId ? { mcpSessionId: sessionId } : {}),
       ...jsonRpcCorrelation(body),
-      clientCorrelation: clientCorrelationHeaders(req)
+      clientCorrelation
     };
   }
 
