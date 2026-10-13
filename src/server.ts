@@ -22,7 +22,12 @@ import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges }
 import { pathRedactions, redactPathsDeep, redactPathsInText } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
 import { requestCorrelationSnapshot } from "./requestContext.js";
-import { bindingMarkerFromCorrelation } from "./bindingMarker.js";
+import {
+  bindingMarkerFromCorrelation,
+  responseBindingConfirmedFromCorrelation,
+  responseBindingInstruction,
+  responseBindingMarkerFromCorrelation
+} from "./bindingMarker.js";
 import { recordTelemetry } from "./telemetry.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
@@ -129,15 +134,23 @@ function tagToolResult(result: any, name: string, options: Record<string, unknow
     structured && typeof structured === "object" && !Array.isArray(structured)
       ? structured
       : {};
-  const marker = bindingMarkerFromCorrelation(requestCorrelationSnapshot());
+  const correlation = requestCorrelationSnapshot();
+  const marker = bindingMarkerFromCorrelation(correlation);
+  const responseBindingConfirmed = responseBindingConfirmedFromCorrelation(correlation);
+  const responseMarker = responseBindingConfirmed ? undefined : responseBindingMarkerFromCorrelation(correlation);
   const tagged = {
     codexpro_tool: name,
     codexpro_title: options.title ?? name,
     ...base,
-    ...(marker ? { codexpro_binding_marker: marker } : {})
+    ...(marker ? { codexpro_binding_marker: marker } : {}),
+    ...(responseMarker ? { codexpro_response_binding_marker: responseMarker } : {})
   };
   const meta = (options._meta as Record<string, unknown> | undefined) ?? {};
   result.structuredContent = meta.ui || meta["openai/outputTemplate"] ? compactStructuredContent(tagged) : tagged;
+  if (responseMarker) {
+    const content = Array.isArray(result.content) ? result.content : [];
+    result.content = [...content, { type: "text", text: responseBindingInstruction(responseMarker) }];
+  }
   if (!config.exposeAbsolutePaths) redactAbsolutePaths(result, config);
   return result;
 }
