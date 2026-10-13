@@ -1,9 +1,20 @@
 import assert from "node:assert/strict";
-import {
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "codexpro-binding-marker-"));
+process.env.CODEXPRO_BINDING_CONFIRMATIONS_PATH = path.join(root, "binding-confirmed.json");
+
+const {
   CODEXPRO_BINDING_MARKER_PREFIX,
   bindingMarkerForFingerprint,
-  bindingMarkerFromCorrelation
-} from "../dist/bindingMarker.js";
+  bindingMarkerFromCorrelation,
+  responseBindingMarkerForRequest,
+  responseBindingMarkerFromCorrelation,
+  responseBindingConfirmedFromCorrelation,
+  responseBindingInstruction
+} = await import("../dist/bindingMarker.js");
 
 const first = bindingMarkerForFingerprint("ABCDEF1234567890");
 const same = bindingMarkerForFingerprint("abcdef123456");
@@ -25,4 +36,51 @@ assert.equal(
 );
 assert.equal(bindingMarkerFromCorrelation({ clientCorrelation: {} }), undefined);
 
-console.log("✓ binding marker smoke test passed");
+const fingerprint = "2ed2cf363b38abcdef";
+const requestA = "request-a";
+const requestB = "request-b";
+const markerA = responseBindingMarkerForRequest(fingerprint, requestA);
+const markerB = responseBindingMarkerForRequest(fingerprint, requestB);
+
+assert.match(markerA ?? "", /^cpb2_[0-9a-f]{24}$/);
+assert.match(markerB ?? "", /^cpb2_[0-9a-f]{24}$/);
+assert.notEqual(markerA, markerB, "cpb2 must be unique per request id");
+assert.equal(responseBindingMarkerForRequest(fingerprint, requestA), markerA, "cpb2 must be deterministic for one request");
+assert.equal(responseBindingMarkerFromCorrelation({
+  requestId: requestA,
+  clientCorrelation: { "x-openai-session-fingerprint": fingerprint }
+}), markerA);
+assert.match(responseBindingInstruction(markerA), new RegExp(markerA));
+
+const correlation = {
+  requestId: requestA,
+  clientCorrelation: { "x-openai-session-fingerprint": fingerprint }
+};
+assert.equal(responseBindingConfirmedFromCorrelation(correlation), false);
+
+fs.writeFileSync(process.env.CODEXPRO_BINDING_CONFIRMATIONS_PATH, JSON.stringify({
+  version: 1,
+  bindings: {
+    [fingerprint.slice(0, 12)]: {
+      thread_id: "thread-legacy",
+      provenance: "codexpro_supervisor_binding_marker",
+      updated_at: "2026-10-13T08:00:00Z"
+    }
+  }
+}));
+assert.equal(responseBindingConfirmedFromCorrelation(correlation), false, "legacy binding must not suppress cpb2 revalidation");
+
+await new Promise(resolve => setTimeout(resolve, 20));
+fs.writeFileSync(process.env.CODEXPRO_BINDING_CONFIRMATIONS_PATH, JSON.stringify({
+  version: 1,
+  bindings: {
+    [fingerprint.slice(0, 12)]: {
+      thread_id: "thread-v2",
+      provenance: "assistant_response_marker_v2",
+      updated_at: "2026-10-13T08:01:00Z"
+    }
+  }
+}));
+assert.equal(responseBindingConfirmedFromCorrelation(correlation), true, "v2 confirmation must stop future marker instructions");
+
+console.log("✓ binding marker v1/v2 smoke test passed");
