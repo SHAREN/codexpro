@@ -138,18 +138,22 @@ function tagToolResult(result: any, name: string, options: Record<string, unknow
   const marker = bindingMarkerFromCorrelation(correlation);
   const responseBindingConfirmed = responseBindingConfirmedFromCorrelation(correlation);
   const responseMarker = responseBindingConfirmed ? undefined : responseBindingMarkerFromCorrelation(correlation);
+  const responseInstruction = responseMarker ? responseBindingInstruction(responseMarker) : undefined;
   const tagged = {
     codexpro_tool: name,
     codexpro_title: options.title ?? name,
     ...base,
     ...(marker ? { codexpro_binding_marker: marker } : {}),
-    ...(responseMarker ? { codexpro_response_binding_marker: responseMarker } : {})
+    ...(responseMarker ? {
+      codexpro_response_binding_marker: responseMarker,
+      codexpro_response_binding_instruction: responseInstruction
+    } : {})
   };
   const meta = (options._meta as Record<string, unknown> | undefined) ?? {};
   result.structuredContent = meta.ui || meta["openai/outputTemplate"] ? compactStructuredContent(tagged) : tagged;
-  if (responseMarker) {
+  if (responseInstruction) {
     const content = Array.isArray(result.content) ? result.content : [];
-    result.content = [...content, { type: "text", text: responseBindingInstruction(responseMarker) }];
+    result.content = [...content, { type: "text", text: responseInstruction }];
   }
   if (!config.exposeAbsolutePaths) redactAbsolutePaths(result, config);
   return result;

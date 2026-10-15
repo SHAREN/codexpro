@@ -50,7 +50,13 @@ assert.equal(responseBindingMarkerFromCorrelation({
   requestId: requestA,
   clientCorrelation: { "x-openai-session-fingerprint": fingerprint }
 }), markerA);
-assert.match(responseBindingInstruction(markerA), new RegExp(markerA));
+const instructionA = responseBindingInstruction(markerA);
+assert.match(instructionA, new RegExp(markerA));
+assert.match(instructionA, /very end of your final answer/i);
+
+const serverSource = fs.readFileSync(new URL("../dist/server.js", import.meta.url), "utf8");
+assert.match(serverSource, /codexpro_response_binding_instruction/);
+assert.match(serverSource, /responseInstruction/);
 
 const correlation = {
   requestId: requestA,
