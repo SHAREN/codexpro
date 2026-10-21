@@ -89,4 +89,23 @@ fs.writeFileSync(process.env.CODEXPRO_BINDING_CONFIRMATIONS_PATH, JSON.stringify
 }));
 assert.equal(responseBindingConfirmedFromCorrelation(correlation), true, "v2 confirmation must stop future marker instructions");
 
+for (const [provenance, thread_id, expected] of [
+  ["codexpro_tool_response_marker_v2", "thread-level1", true],
+  ["cross_node_trace_match_v2", "thread-peer", true],
+  ["cross_node_trace_match", "thread-legacy-peer", false],
+  ["unknown", "thread-unknown", false],
+  ["assistant_response_marker_v2", "", false],
+  ["codexpro_tool_response_marker_v2", "unbound:abcdef123456", false]
+]) {
+  await new Promise(resolve => setTimeout(resolve, 20));
+  fs.writeFileSync(process.env.CODEXPRO_BINDING_CONFIRMATIONS_PATH, JSON.stringify({
+    version: 1,
+    bindings: { [fingerprint.slice(0, 12)]: { thread_id, provenance } }
+  }));
+  assert.equal(responseBindingConfirmedFromCorrelation(correlation), expected, `${provenance}/${thread_id}`);
+}
+fs.unlinkSync(process.env.CODEXPRO_BINDING_CONFIRMATIONS_PATH);
+assert.equal(responseBindingConfirmedFromCorrelation(correlation), false, "withdrawn confirmation must resume instructions");
+fs.rmSync(root, { recursive: true, force: true });
+
 console.log("✓ binding marker v1/v2 smoke test passed");
