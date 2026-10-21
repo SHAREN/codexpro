@@ -29,6 +29,7 @@ import {
   responseBindingMarkerFromCorrelation
 } from "./bindingMarker.js";
 import { recordTelemetry } from "./telemetry.js";
+import { recordBindingEmission } from "./bindingEmission.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -156,6 +157,7 @@ function tagToolResult(result: any, name: string, options: Record<string, unknow
     result.content = [...content, { type: "text", text: responseInstruction }];
   }
   if (!config.exposeAbsolutePaths) redactAbsolutePaths(result, config);
+  recordBindingEmission(result, name, correlation, responseBindingConfirmed, responseMarker, responseInstruction);
   return result;
 }
 
