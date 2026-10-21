@@ -9,7 +9,14 @@ export const CODEXPRO_BINDING_MARKER_PREFIX = "cpb1_";
 export const CODEXPRO_RESPONSE_BINDING_MARKER_PREFIX = "cpb2_";
 const BINDING_MARKER_DOMAIN = "codexpro-binding-v1:";
 const RESPONSE_BINDING_MARKER_DOMAIN = "codexpro-response-binding-v2:";
-const CONFIRMED_BINDING_PROVENANCE = "assistant_response_marker_v2";
+// Keep the collector's evidence provenance intact. Either exact marker level
+// confirms a binding; the collector may also deliver an owned trace peer of an
+// exact binding. Legacy/provisional matches must still request revalidation.
+const CONFIRMED_BINDING_PROVENANCES = new Set([
+  "assistant_response_marker_v2",
+  "codexpro_tool_response_marker_v2",
+  "cross_node_trace_match_v2"
+]);
 
 type ConfirmationCache = {
   path: string;
@@ -95,7 +102,11 @@ export function responseBindingConfirmedFromCorrelation(snapshot: Record<string,
   const fingerprint = correlationFingerprint(snapshot);
   if (!fingerprint) return false;
   const entry = confirmedBindings()[fingerprint];
-  return Boolean(entry?.thread_id && entry?.provenance === CONFIRMED_BINDING_PROVENANCE);
+  return Boolean(
+    typeof entry?.thread_id === "string" && entry.thread_id.trim() &&
+    !entry.thread_id.startsWith("unbound:") &&
+    CONFIRMED_BINDING_PROVENANCES.has(entry.provenance ?? "")
+  );
 }
 
 export function responseBindingInstruction(marker: string): string {
