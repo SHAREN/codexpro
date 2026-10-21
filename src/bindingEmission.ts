@@ -19,6 +19,7 @@ export function recordBindingEmission(
       markerInStructuredContent: Boolean(expected && result?.structuredContent?.codexpro_response_binding_marker === expected),
       instructionInContent: Boolean(expected && instruction && content.some((item: any) => item?.type === "text" && item.text === instruction)),
       markerInContent: Boolean(expected && content.some((item: any) => item?.type === "text" && typeof item.text === "string" && item.text.includes(expected))),
+      markerInPrimaryText: Boolean(expected && content.find((item: any) => item?.type === "text")?.text?.includes(expected)),
       isError: result?.isError === true
     };
     console.error(`[CodexProBindingEmission] ${JSON.stringify(event)}`);

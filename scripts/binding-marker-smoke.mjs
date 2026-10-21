@@ -51,6 +51,18 @@ assert.equal(responseBindingMarkerFromCorrelation({
   clientCorrelation: { "x-openai-session-fingerprint": fingerprint }
 }), markerA);
 const instructionA = responseBindingInstruction(markerA);
+const {withPrimaryBindingContent} = await import("../dist/bindingContent.js");
+const original = [{type:"text",text:JSON.stringify({ok:true,nested:{value:42}})},{type:"image",data:"unchanged"}];
+const decorated = withPrimaryBindingContent(original,"read",markerA,instructionA);
+assert.deepEqual(JSON.parse(decorated[0].text), {ok:true,nested:{value:42},codexpro_tool:"read",codexpro_response_binding_marker:markerA,codexpro_response_binding_instruction:instructionA});
+assert.equal(JSON.parse(original[0].text).codexpro_tool,undefined,"must not mutate the original content");
+assert.equal(decorated[1],original[1],"non-text payloads unchanged");
+assert.equal(withPrimaryBindingContent([{type:"text",text:"plain result"}],"read",markerA,instructionA)[0].text,`plain result\n\n${instructionA}`);
+for (const text of ["[]","null","123",'"value"']) {
+ const content=[{type:"text",text}];
+ assert.equal(withPrimaryBindingContent(content,"read",markerA,instructionA),content,"preserve non-object JSON contracts");
+}
+assert.deepEqual(withPrimaryBindingContent([],"read",markerA,instructionA),[]);
 assert.match(instructionA, new RegExp(markerA));
 assert.match(instructionA, /very end of your final answer/i);
 

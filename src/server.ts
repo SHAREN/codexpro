@@ -30,6 +30,7 @@ import {
 } from "./bindingMarker.js";
 import { recordTelemetry } from "./telemetry.js";
 import { recordBindingEmission } from "./bindingEmission.js";
+import { withPrimaryBindingContent } from "./bindingContent.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -154,7 +155,7 @@ function tagToolResult(result: any, name: string, options: Record<string, unknow
   result.structuredContent = meta.ui || meta["openai/outputTemplate"] ? compactStructuredContent(tagged) : tagged;
   if (responseInstruction) {
     const content = Array.isArray(result.content) ? result.content : [];
-    result.content = [...content, { type: "text", text: responseInstruction }];
+    result.content = [...withPrimaryBindingContent(content, name, responseMarker!, responseInstruction), { type: "text", text: responseInstruction }];
   }
   if (!config.exposeAbsolutePaths) redactAbsolutePaths(result, config);
   recordBindingEmission(result, name, correlation, responseBindingConfirmed, responseMarker, responseInstruction);
