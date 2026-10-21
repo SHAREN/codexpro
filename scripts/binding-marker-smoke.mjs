@@ -106,6 +106,46 @@ for (const [provenance, thread_id, expected] of [
 }
 fs.unlinkSync(process.env.CODEXPRO_BINDING_CONFIRMATIONS_PATH);
 assert.equal(responseBindingConfirmedFromCorrelation(correlation), false, "withdrawn confirmation must resume instructions");
+
+const { recordBindingEmission } = await import('../dist/bindingEmission.js');
+const previousLog = process.env.CODEXPRO_LOG_TOOL_CALLS;
+const previousRequests = process.env.CODEXPRO_LOG_REQUESTS;
+const previousError = console.error;
+const emissions = [];
+try {
+  process.env.CODEXPRO_LOG_TOOL_CALLS = '1';
+  delete process.env.CODEXPRO_LOG_REQUESTS;
+  console.error = value => emissions.push(JSON.parse(value.slice(value.indexOf(']') + 2)));
+  const returned = { content: [{type:'text',text:'private tool output'}, {type:'text',text:instructionA}],
+    structuredContent: {codexpro_response_binding_marker:markerA,privateValue:'private structured output'} };
+  recordBindingEmission(returned,'read',correlation,false,markerA,instructionA);
+  assert.equal(emissions[0].requestId,requestA);
+  assert.equal(emissions[0].clientSessionFingerprint,fingerprint.slice(0,12));
+  assert.equal(emissions[0].confirmed,false);
+  assert.equal(emissions[0].expectedMarker,markerA);
+  assert.equal(emissions[0].markerInStructuredContent,true);
+  assert.equal(emissions[0].instructionInContent,true);
+  assert.equal(emissions[0].markerInContent,true);
+  assert.ok(!JSON.stringify(emissions).includes('private'));
+  recordBindingEmission({content:[]},'read',correlation,false,markerA,instructionA);
+  assert.equal(emissions[1].instructionInContent,false);
+  assert.equal(emissions[1].markerInStructuredContent,false);
+  recordBindingEmission({content:[]},'read',correlation,true,undefined,undefined);
+  assert.equal(emissions[2].confirmed,true);
+  assert.equal(emissions[2].expectedMarker,undefined);
+  recordBindingEmission({content:[]},'read',{},false,undefined,undefined);
+  assert.equal(emissions.length,3,'uncorrelated calls must not create unusable emission records');
+  delete process.env.CODEXPRO_LOG_TOOL_CALLS;
+  recordBindingEmission(returned,'read',correlation,false,markerA,instructionA);
+  assert.equal(emissions.length,3,'disabled logging must remain disabled');
+  process.env.CODEXPRO_LOG_TOOL_CALLS = '1';
+  console.error = () => {throw Error('logging failed');};
+  assert.doesNotThrow(()=>recordBindingEmission(returned,'read',correlation,false,markerA,instructionA));
+} finally {
+  console.error = previousError;
+  if(previousLog === undefined) delete process.env.CODEXPRO_LOG_TOOL_CALLS; else process.env.CODEXPRO_LOG_TOOL_CALLS = previousLog;
+  if(previousRequests === undefined) delete process.env.CODEXPRO_LOG_REQUESTS; else process.env.CODEXPRO_LOG_REQUESTS = previousRequests;
+}
 fs.rmSync(root, { recursive: true, force: true });
 
 console.log("✓ binding marker v1/v2 smoke test passed");
