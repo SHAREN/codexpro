@@ -30,6 +30,14 @@ jobs:
       - name: Install
         run: npm ci
 
+      - name: Isolate test home and preserve selected Node in login shells
+        shell: bash
+        run: |
+          test_home="$RUNNER_TEMP/codexpro-home-${{ matrix.node }}"
+          mkdir -p "$test_home"
+          printf 'export PATH=%q\n' "$PATH" > "$test_home/.bash_profile"
+          echo "HOME=$test_home" >> "$GITHUB_ENV"
+
       - name: Build
         run: npm run build
 
