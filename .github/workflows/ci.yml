@@ -8,17 +8,16 @@ on:
 
 jobs:
   build:
+    # Public fork PRs must not execute on the owner's computer.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
         node:
           - 20
           - 24
 
-    runs-on: ${{ matrix.os }}
+    runs-on: [self-hosted, Linux, X64, home-pc]
 
     steps:
       - name: Checkout
@@ -32,6 +31,14 @@ jobs:
 
       - name: Install
         run: npm ci
+
+      - name: Isolate test home and preserve selected Node in login shells
+        shell: bash
+        run: |
+          test_home="$RUNNER_TEMP/codexpro-home-${{ matrix.node }}"
+          mkdir -p "$test_home"
+          printf 'export PATH=%q\n' "$PATH" > "$test_home/.bash_profile"
+          echo "HOME=$test_home" >> "$GITHUB_ENV"
 
       - name: Build
         run: npm run build
