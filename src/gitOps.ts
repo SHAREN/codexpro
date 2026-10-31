@@ -121,7 +121,7 @@ function rewriteStatusPaths(output: string, context: GitContext, workspace: Work
   }).join("\n");
 }
 
-function runGit(config: CodexProConfig, workspace: Workspace, args: string[], maxOutputBytes: number, context = defaultGitContext(workspace), rewritePaths = false): string {
+export function runGit(config: CodexProConfig, workspace: Workspace, args: string[], maxOutputBytes: number, context = defaultGitContext(workspace), rewritePaths = false): string {
   const result = spawnSync(gitExecutable(config), args, {
     cwd: context.cwd,
     encoding: "utf8",

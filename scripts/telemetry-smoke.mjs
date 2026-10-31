@@ -1,12 +1,17 @@
 import assert from 'node:assert/strict';
 
 import {
+  classifySessionState,
   recordTelemetry,
   resetTelemetryForTest,
   telemetrySnapshot
 } from '../dist/telemetry.js';
 
 resetTelemetryForTest();
+assert.equal(classifySessionState({ activeRequests: 1, idleForMs: 60000, lastRequestedTool: 'bash', lastJsonRpcMethod: 'tools/call' }), 'request_active');
+assert.equal(classifySessionState({ activeRequests: 0, idleForMs: 10000, lastRequestedTool: 'bash', lastJsonRpcMethod: 'tools/call' }), 'idle_between_requests');
+assert.equal(classifySessionState({ activeRequests: 0, idleForMs: 35860, lastRequestedTool: 'bash', lastJsonRpcMethod: 'tools/call', stallThresholdMs: 30000 }), 'client_stall_candidate');
+assert.equal(classifySessionState({ activeRequests: 0, idleForMs: 60000, lastJsonRpcMethod: 'initialize' }), 'idle_between_requests');
 
 recordTelemetry({
   ts: '2026-10-03T10:00:00.000Z',

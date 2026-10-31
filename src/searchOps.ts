@@ -18,6 +18,7 @@ export interface SearchOptions {
   intent?: AnalysisSearchIntent;
   symbol?: string;
   includeTests?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface SearchResult {
@@ -117,10 +118,14 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
   args.push("-e", options.query, "--", target.absPath);
 
   return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) { reject(new CodexProError("Search cancelled by client.")); return; }
     const child = spawn("rg", args, { cwd: workspace.root, env: { ...process.env, NO_COLOR: "1" } });
     let stdout = "";
     let stderr = "";
     let outputLimited = false;
+    let cancelled = false;
+    const onAbort = () => { cancelled = true; child.kill("SIGTERM"); };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
     child.stdout.on("data", (chunk) => {
       stdout += String(chunk);
       if (!outputLimited && Buffer.byteLength(stdout, "utf8") > config.maxOutputBytes) {
@@ -133,6 +138,8 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
     });
     child.on("error", reject);
     child.on("close", (code) => {
+      options.signal?.removeEventListener("abort", onAbort);
+      if (cancelled) { reject(new CodexProError("Search cancelled by client.")); return; }
       if (code && code > 1) {
         reject(new CodexProError(stderr.trim() || `ripgrep failed with exit code ${code}`));
         return;
@@ -175,12 +182,14 @@ async function runNodeSearch(config: CodexProConfig, guard: PathGuard, workspace
     root: options.root,
     glob: options.glob,
     includeHidden: options.includeHidden,
-    maxFiles: 20_000
+    maxFiles: 20_000,
+    signal: options.signal
   });
   const matches: Array<{ path: string; line: number; text: string }> = [];
   let visibleMatches = 0;
   const scanBytes = textScanByteLimit(config);
   for (const rel of files) {
+    if (options.signal?.aborted) throw new CodexProError("Search cancelled by client.");
     if (visibleMatches > options.maxResults) break;
     const resolved = guard.resolve(workspace, rel);
     try {
@@ -220,7 +229,8 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
     maxResults: Math.max(1, Math.min(rawOptions.maxResults ?? config.maxSearchResults, config.maxSearchResults)),
     intent: rawOptions.intent,
     symbol: rawOptions.symbol,
-    includeTests: rawOptions.includeTests
+    includeTests: rawOptions.includeTests,
+    signal: rawOptions.signal
   };
   let lexical: SearchResult;
   const backend = await searchBackendStatus();
@@ -247,13 +257,15 @@ export async function searchWorkspace(config: CodexProConfig, guard: PathGuard, 
     return lexical;
   }
   try {
+    if (options.signal?.aborted) throw new CodexProError("Search cancelled by client.");
     lexical.analysis = await searchWorkspaceStructured(config, guard, workspace, {
       query,
       intent: rawOptions.intent ?? "auto",
       includeTests: Boolean(rawOptions.includeTests),
       regex: Boolean(rawOptions.regex),
       root: options.root,
-      maxResults: options.maxResults
+      maxResults: options.maxResults,
+      signal: options.signal
     });
   } catch (error) {
     lexical.analysis = {

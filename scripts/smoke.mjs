@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 process.env.CODEXPRO_EXPOSE_ABSOLUTE_PATHS = '1';
+if (process.platform === 'win32' && !process.env.CODEXPRO_BASH_RUNTIME) process.env.CODEXPRO_BASH_RUNTIME = 'wsl';
 
 function encode(message) {
   return `${JSON.stringify(message)}\n`;

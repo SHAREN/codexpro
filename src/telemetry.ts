@@ -1,5 +1,24 @@
 export type CodexProTelemetryKind = "request" | "tool" | "session";
 
+export type CodexProSessionState = "request_active" | "idle_between_requests" | "client_stall_candidate";
+
+export function classifySessionState(options: {
+  activeRequests: number;
+  idleForMs: number;
+  lastRequestedTool?: string;
+  lastJsonRpcMethod?: string;
+  stallThresholdMs?: number;
+}): CodexProSessionState {
+  if (options.activeRequests > 0) return "request_active";
+  const threshold = Math.max(5_000, options.stallThresholdMs ?? 30_000);
+  if (
+    options.idleForMs >= threshold
+    && options.lastJsonRpcMethod === "tools/call"
+    && Boolean(options.lastRequestedTool)
+  ) return "client_stall_candidate";
+  return "idle_between_requests";
+}
+
 export type CodexProTelemetryEvent = {
   seq: number;
   ts: string;
