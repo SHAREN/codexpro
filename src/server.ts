@@ -21,7 +21,7 @@ import { hasSecretValue, redactSensitiveText, redactStructured } from "./redact.
 import { inspectWorkspace, invalidateWorkspaceAnalysis, reviewWorkspaceChanges } from "./analysis/index.js";
 import { pathRedactions, redactPathsDeep, redactPathsInText } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
-import { requestCorrelationSnapshot } from "./requestContext.js";
+import { currentMcpRequestContext, requestCorrelationSnapshot } from "./requestContext.js";
 import {
   bindingMarkerFromCorrelation,
   responseBindingConfirmedFromCorrelation,
@@ -31,6 +31,9 @@ import {
 import { recordTelemetry } from "./telemetry.js";
 import { recordBindingEmission } from "./bindingEmission.js";
 import { withPrimaryBindingContent } from "./bindingContent.js";
+import { Runtime } from "./runtimeOps.js";
+import { Tasks } from "./taskOps.js";
+import { registerRuntimeTools, RUNTIME_TOOLS, EXECUTION_TOOLS, TASK_WRITE_TOOLS } from "./runtimeTools.js";
 
 const STRUCTURED_STRING_MAX_CHARS = 30_000;
 
@@ -66,6 +69,25 @@ function textResult(text: string, structuredContent: Record<string, unknown> = {
 function countTextLines(value: string | undefined): number {
   if (!value) return 0;
   return value.split(/\r?\n/).filter((line) => line.length > 0).length;
+}
+
+function interactiveBashBudgetMs(): number {
+  const value = Number(process.env.CODEXPRO_INTERACTIVE_BASH_BUDGET_MS ?? 45_000);
+  if (!Number.isFinite(value)) return 45_000;
+  return Math.max(1_000, Math.min(55_000, Math.floor(value)));
+}
+
+function interactiveSearchBudgetMs(): number {
+  const value = Number(process.env.CODEXPRO_INTERACTIVE_SEARCH_BUDGET_MS ?? 45_000);
+  if (!Number.isFinite(value)) return 45_000;
+  return Math.max(1_000, Math.min(55_000, Math.floor(value)));
+}
+
+function managedBashDefaultTimeoutMs(config: CodexProConfig): number {
+  const floor = Math.min(config.maxBashTimeoutMs, interactiveBashBudgetMs() + 30_000);
+  const value = Number(process.env.CODEXPRO_BASH_JOB_TIMEOUT_MS ?? Math.min(config.maxBashTimeoutMs, 600_000));
+  if (!Number.isFinite(value)) return Math.max(floor, Math.min(config.maxBashTimeoutMs, 600_000));
+  return Math.max(floor, Math.min(config.maxBashTimeoutMs, Math.floor(value)));
 }
 
 function bashTextResult(config: CodexProConfig, result: Awaited<ReturnType<typeof runBash>>): string {
@@ -412,7 +434,13 @@ function registerToolCardResource(server: McpServer, config: CodexProConfig): vo
   }
 }
 
-type CodexToolHandler = (args: any) => Promise<any> | any;
+type CodexToolContext = {
+  signal?: AbortSignal;
+  _meta?: { progressToken?: string | number; [key: string]: unknown };
+  requestId?: string | number;
+  sendNotification?: (notification: any) => Promise<void>;
+};
+type CodexToolHandler = (args: any, context?: CodexToolContext) => Promise<any> | any;
 
 const SUPERTOOL_NAME = "codexpro";
 const SUPERTOOL_ACTION_ALIASES: Record<string, string> = {
@@ -472,18 +500,38 @@ function registerToolCompat(
   server: McpServer,
   name: string,
   options: Record<string, unknown>,
-  handler: (args: any) => Promise<any> | any
+  handler: CodexToolHandler
 ): void {
-  const wrapped = async (args: any) => {
+  const wrapped = async (args: any, extra?: CodexToolContext) => {
     const started = Date.now();
     const callId = ++toolCallSequence;
     logToolCallStart(callId, name, started, args ?? {});
-    const heartbeat = toolCallObservabilityEnabled()
-      ? setInterval(() => logToolCallHeartbeat(callId, name, started), toolCallHeartbeatMs())
+    const httpSignal = currentMcpRequestContext()?.abortSignal;
+    const signals = [extra?.signal, httpSignal].filter((value): value is AbortSignal => Boolean(value));
+    const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+    const context: CodexToolContext = { ...extra, ...(signal ? { signal } : {}) };
+    const progressToken = extra?._meta?.progressToken;
+    const heartbeatNeeded = toolCallObservabilityEnabled() || (progressToken !== undefined && Boolean(extra?.sendNotification));
+    const heartbeat = heartbeatNeeded
+      ? setInterval(() => {
+          logToolCallHeartbeat(callId, name, started);
+          if (progressToken !== undefined && extra?.sendNotification) {
+            const elapsedMs = Date.now() - started;
+            void extra.sendNotification({
+              method: "notifications/progress",
+              params: {
+                progressToken,
+                progress: elapsedMs,
+                message: `${name} still running (${Math.max(1, Math.round(elapsedMs / 1000))}s elapsed)`
+              }
+            }).catch(() => undefined);
+          }
+        }, toolCallHeartbeatMs())
       : undefined;
     heartbeat?.unref?.();
     try {
-      const result = tagToolResult(await handler(args ?? {}), name, options, config);
+      if (signal?.aborted) throw new CodexProError(`${name} cancelled before execution.`);
+      const result = tagToolResult(await handler(args ?? {}, context), name, options, config);
       logToolCallFinish(callId, name, result?.isError ? "error" : "ok", started, result);
       return result;
     } catch (error) {
@@ -535,6 +583,7 @@ const MINIMAL_TOOL_NAMES = [
 ] as const;
 
 const STANDARD_TOOL_NAMES = [
+  ...RUNTIME_TOOLS,
   ...MINIMAL_TOOL_NAMES,
   "inspect_workspace",
   "tree",
@@ -548,6 +597,7 @@ const STANDARD_TOOL_NAMES = [
 ] as const;
 
 const FULL_TOOL_NAMES = [
+  ...RUNTIME_TOOLS,
   SUPERTOOL_NAME,
   "server_config",
   "codexpro_self_test",
@@ -579,6 +629,11 @@ const FULL_TOOL_NAMES = [
 ] as const;
 
 const CONNECTION_TEST_HIDDEN_TOOLS = new Set<string>([
+  ...EXECUTION_TOOLS,
+  ...TASK_WRITE_TOOLS,
+  "cancel_job",
+  "remove_job",
+  "close_shell",
   SUPERTOOL_NAME,
   "codexpro_self_test",
   "write",
@@ -629,7 +684,7 @@ function toolNamesForMode(config: CodexProConfig): string[] {
   for (const name of codexSessionToolNames(config)) {
     if (!names.includes(name)) names.push(name);
   }
-  return names;
+  return names.filter((name) => runtimeToolAllowed(config, name));
 }
 
 const MINIMAL_TOOLS = new Set<string>(MINIMAL_TOOL_NAMES);
@@ -647,7 +702,14 @@ function registeredToolNames(server: McpServer): string[] {
   return [...(registeredToolNamesByServer.get(server as object) ?? [])];
 }
 
+function runtimeToolAllowed(config: CodexProConfig, name: string): boolean {
+  if (EXECUTION_TOOLS.includes(name) && config.bashMode === "off") return false;
+  if (TASK_WRITE_TOOLS.includes(name) && config.writeMode === "off") return false;
+  return true;
+}
+
 function shouldRegisterTool(config: CodexProConfig, name: string): boolean {
+  if (!runtimeToolAllowed(config, name)) return false;
   if (config.connectionTest && CONNECTION_TEST_HIDDEN_TOOLS.has(name)) return false;
   if (name === "bash" && config.bashMode === "off") return false;
   if ((name === "write" || name === "edit" || name === "apply_patch" || name === "import_file") && config.writeMode !== "workspace") return false;
@@ -668,7 +730,7 @@ function registerCodexTool(
   handler: CodexToolHandler
 ): void {
   if (!shouldRegisterTool(config, name)) return;
-  const validatedHandler: CodexToolHandler = (args) => handler(validateToolArgs(name, options, args));
+  const validatedHandler: CodexToolHandler = (args, context) => handler(validateToolArgs(name, options, args), context);
   registerToolCompat(config, server, name, descriptorOptionsForConfig(config, name, options), validatedHandler);
   rememberRegisteredTool(server, name);
   rememberRegisteredToolHandler(server, name, validatedHandler);
@@ -1135,14 +1197,23 @@ const HANDOFF_WRITE_ANNOTATIONS = { readOnlyHint: false, openWorldHint: false, d
 
 export function createCodexProServer(
   config: CodexProConfig,
-  options: { workspaceRegistry?: WorkspaceRegistry } = {}
+  options: { workspaceRegistry?: WorkspaceRegistry; runtime?: Runtime } = {}
 ): McpServer {
   const workspaces = new WorkspaceManager(config, options.workspaceRegistry);
+  const runtime = options.runtime ?? new Runtime(config);
   const reviewCheckpoints = new Map<string, string>();
   const guard = new PathGuard(config);
   const server = new McpServer({ name: "CodexPro", version: CODEXPRO_VERSION }, { instructions: serverInstructions(config) });
   registeredToolNamesByServer.set(server as object, []);
   registerToolCardResource(server, config);
+
+  const tasks = new Tasks(config, runtime);
+  registerRuntimeTools(runtime, tasks, workspaces, (name, runtimeOptions, handler) => {
+    registerCodexTool(config, server, name, runtimeOptions, async (args) => {
+      const result = await handler(args) as Record<string, unknown>;
+      return textResult(JSON.stringify(result, null, 2), result);
+    });
+  });
 
   registerCodexTool(
     config,
@@ -1163,7 +1234,7 @@ export function createCodexProServer(
         "openai/toolInvocation/invoked": "CodexPro supertool action complete"
       }
     },
-    async (args) => {
+    async (args, context) => {
       const action = normalizeSupertoolAction(args.action);
       const names = registeredToolNames(server).filter((name) => name !== SUPERTOOL_NAME);
       if (action === "list_actions" || action === "help") {
@@ -1210,7 +1281,7 @@ export function createCodexProServer(
           : {};
       let result: any;
       try {
-        result = await handler(childArgs);
+        result = await handler(childArgs, context);
       } catch (error) {
         result = errorResult(error);
       }
@@ -2073,9 +2144,15 @@ export function createCodexProServer(
         "openai/toolInvocation/invoked": "Workspace search complete"
       }
     },
-    async (args) => {
+    async (args, context) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
-      const result = await searchWorkspace(config, guard, workspace, {
+      const budgetMs = interactiveSearchBudgetMs();
+      const budgetSignal = AbortSignal.timeout(budgetMs);
+      const signal = context?.signal ? AbortSignal.any([context.signal, budgetSignal]) : budgetSignal;
+      let result;
+      try {
+        result = await searchWorkspace(config, guard, workspace, {
+        signal,
         query: args.query,
         regex: parseBool(args.regex, false),
         root: args.path ?? ".",
@@ -2085,7 +2162,13 @@ export function createCodexProServer(
         intent: args.intent,
         symbol: args.symbol,
         includeTests: args.include_tests === undefined ? undefined : parseBool(args.include_tests, false)
-      });
+        });
+      } catch (error) {
+        if (budgetSignal.aborted && !context?.signal?.aborted) {
+          throw new CodexProError(`Search exceeded the interactive budget of ${budgetMs} ms. Narrow path/glob/query or split the search into smaller requests.`);
+        }
+        throw error;
+      }
       const structured: Record<string, unknown> = {
         workspace_id: workspace.id,
         root: workspace.root,
@@ -2388,7 +2471,7 @@ export function createCodexProServer(
     {
       title: "Bash",
       description:
-        "Run one allowlisted verification command in the workspace, such as tests, build, lint, typecheck, or a project script. Do not use for git status/diff or file inspection; use show_changes, tree, search, and read instead. Do not chain commands with &&, pipes, redirects, or shell file readers.",
+        "Run one allowlisted verification command in the workspace. Execution is owned by the managed runtime from the start: short commands return normally; a command that exceeds the interactive budget returns running + job_id and continues once in the background. Use get_job/job_logs/cancel_job to monitor it. Do not use nested detach syntax such as nohup, setsid -f, or trailing &.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         command: z.string().describe("Command to run."),
@@ -2400,7 +2483,7 @@ export function createCodexProServer(
           .min(1000)
           .max(MAX_BASH_TIMEOUT_MS)
           .optional()
-          .describe(`Timeout in milliseconds. Default: 30000. Max: ${config.maxBashTimeoutMs}.`)
+          .describe(`Maximum execution time in milliseconds. Default managed-job timeout: ${managedBashDefaultTimeoutMs(config)}. Max: ${config.maxBashTimeoutMs}. The MCP call itself is released earlier at the interactive budget.`)
       },
       annotations: BASH_ANNOTATIONS,
       _meta: {
@@ -2409,15 +2492,44 @@ export function createCodexProServer(
         "openai/toolInvocation/invoked": "Bash command finished"
       }
     },
-    async (args) => {
+    async (args, context) => {
       const workspace = workspaces.getWorkspace(args.workspace_id);
-      const result = await runBash(config, guard, workspace, String(args.command ?? ""), {
-        cwd: args.cwd,
-        timeoutMs: args.timeout_ms,
-        sessionId: args.session_id
-      });
-      const text = bashTextResult(config, result);
-      return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result, bash_session_id: result.bashSessionId ?? null });
+      const command = String(args.command ?? "");
+      const timeoutMs = Math.max(1_000, Math.min(args.timeout_ms ?? managedBashDefaultTimeoutMs(config), config.maxBashTimeoutMs));
+      const started = Date.now();
+      const job = await runtime.startJob(workspace, command, args.cwd ?? ".", args.session_id, timeoutMs);
+      let current;
+      try {
+        current = await runtime.waitForJob(workspace, job.job_id, interactiveBashBudgetMs(), context?.signal);
+      } catch (error) {
+        try {
+          const terminal = runtime.getJob(workspace, job.job_id);
+          if (terminal.status !== "running") runtime.removeJob(workspace, job.job_id);
+        } catch {
+          // Preserve the original cancellation/error. Cleanup is best-effort.
+        }
+        throw error;
+      }
+      if (current.status === "running") {
+        const logs = runtime.jobLogs(workspace, job.job_id, "stdout");
+        return textResult(
+          `# Bash
+
+Command is still running as managed job ${job.job_id}. ChatGPT is free to continue other work; use get_job and job_logs to monitor it.`,
+          { workspace_id: workspace.id, root: workspace.root, command, cwd: current.cwd, status: current.status, job_id: job.job_id, durationMs: Date.now() - started, last_output: logs.text, next_actions: ["get_job", "job_logs", "cancel_job", "remove_job"] }
+        );
+      }
+      const output = runtime.jobOutput(workspace, job.job_id);
+      let stderr = output.stderr;
+      if (current.status === "timed_out") stderr += `\n[codexpro] Command timed out after ${timeoutMs} ms.`;
+      const invocation = bashRuntimeStatus(config);
+      const result = {
+        command, cwd: current.cwd, exitCode: current.exit_code, signal: null, durationMs: Date.now() - started, stdout: output.stdout, stderr, truncated: output.truncated,
+        bashRuntime: invocation.selected_runtime ?? config.bashRuntime, bashExecutable: invocation.executable ?? "", bashSessionId: args.session_id
+      };
+      runtime.removeJob(workspace, job.job_id);
+      const text = bashTextResult(config, result as Awaited<ReturnType<typeof runBash>>);
+      return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result, status: current.status, bash_session_id: result.bashSessionId ?? null });
     }
   );
 

@@ -8,6 +8,7 @@ export type McpRequestContext = {
   jsonRpcMethod?: string;
   requestedTool?: string;
   clientCorrelation?: Record<string, string>;
+  abortSignal?: AbortSignal;
 };
 
 const storage = new AsyncLocalStorage<McpRequestContext>();

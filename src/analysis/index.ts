@@ -26,14 +26,16 @@ function areasFor(files: WorkspaceAnalysis["files"]): WorkspaceAnalysis["areas"]
   return [...counts.entries()].map(([areaPath, value]) => ({ path: areaPath, ...value })).sort((a, b) => b.files - a.files || a.path.localeCompare(b.path));
 }
 
-export async function inspectWorkspace(config: CodexProConfig, guard: PathGuard, workspace: Workspace): Promise<WorkspaceAnalysis> {
+export async function inspectWorkspace(config: CodexProConfig, guard: PathGuard, workspace: Workspace, options: { signal?: AbortSignal } = {}): Promise<WorkspaceAnalysis> {
   if (!config.analysisEnabled) throw new Error("Repository analysis is disabled by CODEXPRO_ANALYSIS=0.");
-  const inventory = await inventoryWorkspace(config, guard, workspace);
+  if (options.signal?.aborted) throw new Error("Repository analysis cancelled by client.");
+  const inventory = await inventoryWorkspace(config, guard, workspace, options);
   const key = cacheKey(workspace, inventory.fingerprint, config);
   const cached = getCachedWorkspaceAnalysis(key);
   if (cached) return { ...cached, cache: { hit: true, key } };
 
-  const extraction = await extractWorkspaceFiles(config, guard, workspace, inventory.files);
+  const extraction = await extractWorkspaceFiles(config, guard, workspace, inventory.files, options);
+  if (options.signal?.aborted) throw new Error("Repository analysis cancelled by client.");
   const symbols = extraction.files.flatMap((file) => file.symbols).slice(0, config.analysisLimits.maxSymbols);
   const relationships = buildRelationships(extraction.files, inventory.files, config.analysisLimits.maxRelationships);
   const languages = [...new Set(inventory.files.map((file) => file.language).filter((language) => language !== "unknown"))].sort();
@@ -71,11 +73,11 @@ export async function searchWorkspaceStructured(
   config: CodexProConfig,
   guard: PathGuard,
   workspace: Workspace,
-  options: { query: string; intent?: AnalysisSearchIntent; includeTests?: boolean; regex?: boolean; root?: string; maxResults?: number }
+  options: { query: string; intent?: AnalysisSearchIntent; includeTests?: boolean; regex?: boolean; root?: string; maxResults?: number; signal?: AbortSignal }
 ): Promise<StructuredSearchResult> {
   const query = options.query.trim();
   if (!query) throw new Error("query is required.");
-  const analysis = await inspectWorkspace(config, guard, workspace);
+  const analysis = await inspectWorkspace(config, guard, workspace, { signal: options.signal });
   const intent = classifySearchIntent(query, options.intent ?? "auto", options.regex);
   const groups = emptySearchGroups();
   const lowered = query.toLowerCase();
@@ -87,6 +89,7 @@ export async function searchWorkspaceStructured(
   const inScope = (filePath: string) => !resolvedRoot || filePath === resolvedRoot || filePath.startsWith(`${resolvedRoot}/`);
   const definitionsByPath = new Map<string, Map<number, WorkspaceAnalysis["symbols"][number]>>();
   for (const symbol of analysis.symbols) {
+    if (options.signal?.aborted) throw new Error("Repository analysis cancelled by client.");
     const byLine = definitionsByPath.get(symbol.path) ?? new Map<number, WorkspaceAnalysis["symbols"][number]>();
     byLine.set(symbol.line, symbol);
     definitionsByPath.set(symbol.path, byLine);
@@ -112,6 +115,7 @@ export async function searchWorkspaceStructured(
 
   scan:
   for (const file of analysis.files) {
+    if (options.signal?.aborted) throw new Error("Repository analysis cancelled by client.");
     if (file.generated || (!options.includeTests && file.role === "test")) continue;
     if (!inScope(file.path) && !(options.includeTests && file.role === "test")) continue;
     if (scannedFiles >= config.analysisLimits.maxAnalyzedFiles || scannedBytes + file.bytes > config.analysisLimits.maxScannedBytes) {
@@ -136,6 +140,7 @@ export async function searchWorkspaceStructured(
     const definitions = definitionsByPath.get(file.path) ?? new Map();
     const lines = text.split(/\r?\n/);
     for (let index = 0; index < lines.length; index += 1) {
+      if ((index & 255) === 0 && options.signal?.aborted) throw new Error("Repository analysis cancelled by client.");
       const line = lines[index];
       if (!line.toLowerCase().includes(lowered)) continue;
       const symbol = definitions.get(index + 1);
@@ -169,6 +174,7 @@ export async function searchWorkspaceStructured(
         .map((symbol) => symbol.path)
     );
     for (const relationship of analysis.relationships) {
+      if (options.signal?.aborted) throw new Error("Repository analysis cancelled by client.");
       if (!definitionPaths.has(relationship.to)) continue;
       const group = relationship.kind === "tests" ? "tests" : "references";
       if (group === "tests" && !options.includeTests) continue;

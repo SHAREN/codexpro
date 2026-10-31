@@ -206,3 +206,7 @@ npm run release:publish
 - [Changelog](CHANGELOG.md)
 - [ChatGPT Control / Threads integration](docs/chatgpt-control-integration.md) *(SHAREN fork)*
 - [Contributors](CONTRIBUTORS.md)
+
+## Runtime and recovery
+
+Managed Bash handoff, durable background jobs, cancellation/progress handling, persistent Bash, task checkpoints and the local Runtime Console are available in standard/full tool mode. Long Bash calls can return `running + job_id` instead of holding one MCP request open; search has a bounded interactive budget, and telemetry distinguishes server work from client-side post-result stalls. See [Runtime and recovery](docs/runtime.md) for tools, examples, persistence and security boundaries.

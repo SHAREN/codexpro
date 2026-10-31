@@ -147,7 +147,21 @@ function isAllowedPackageScript(command: string): boolean {
   return packageScriptPattern.test(command);
 }
 
-function assertSafeCommand(config: CodexProConfig, command: string): void {
+export function assertNoNestedDetach(command: string): void {
+  const normalized = compact(command);
+  const tokens = normalized.split(" ");
+  const setsidIndex = tokens.indexOf("setsid");
+  const detached = /(^|\s)(nohup|disown)(\s|$)/.test(normalized)
+    || (setsidIndex >= 0 && tokens.slice(setsidIndex + 1).includes("-f"))
+    || /&\s*$/.test(normalized);
+  if (detached) {
+    throw new CodexProError(
+      "Detached background syntax is blocked inside CodexPro Bash. Use start_job instead; it owns the process lifecycle, logs, cancellation and restart state."
+    );
+  }
+}
+
+export function assertSafeCommand(config: CodexProConfig, command: string): void {
   if (config.bashMode === "off") {
     throw new CodexProError("bash tool is disabled. Start with CODEXPRO_BASH_MODE=safe or CODEXPRO_BASH_MODE=full to enable it.");
   }
@@ -173,7 +187,7 @@ function assertSafeCommand(config: CodexProConfig, command: string): void {
   }
 }
 
-function assertBashSession(config: CodexProConfig, sessionId?: string): string | undefined {
+export function assertBashSession(config: CodexProConfig, sessionId?: string): string | undefined {
   const requested = sessionId?.trim();
   if (!config.bashSessionId) {
     if (config.requireBashSession) {
@@ -473,7 +487,7 @@ export function decodeBashOutput(
   }
 }
 
-function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
+export function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
   if (!child.pid) return;
   if (process.platform === "win32") {
     // Windows does not provide Unix-style cooperative signals to process trees.
@@ -496,16 +510,18 @@ export async function runBash(
   guard: PathGuard,
   workspace: Workspace,
   command: string,
-  options: { cwd?: string; timeoutMs?: number; sessionId?: string } = {}
+  options: { cwd?: string; timeoutMs?: number; sessionId?: string; signal?: AbortSignal } = {}
 ): Promise<BashResult> {
   if (!command?.trim()) throw new CodexProError("command is required.");
   const bashSessionId = assertBashSession(config, options.sessionId);
+  assertNoNestedDetach(command);
   assertSafeCommand(config, command);
   const cwdResolved = guard.resolve(workspace, options.cwd ?? ".");
   const cwd = cwdResolved.absPath;
   const invocation = resolveBashInvocation(config);
   const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs ?? 30_000, config.maxBashTimeoutMs));
   const start = Date.now();
+  if (options.signal?.aborted) throw new CodexProError("Bash command cancelled before execution.");
 
   return new Promise((resolve, reject) => {
     const child = spawn(invocation.executable, invocation.args(command), {
@@ -520,6 +536,7 @@ export async function runBash(
     const stderrChunks: Buffer[] = [];
     let killedByTimeout = false;
     let killedByOutputLimit = false;
+    let cancelledBySignal = false;
     let closed = false;
     let terminationStarted = false;
     let killTimer: NodeJS.Timeout | undefined;
@@ -547,6 +564,11 @@ export async function runBash(
       retainedBytes += retained.byteLength;
     };
 
+    const onAbort = () => {
+      cancelledBySignal = true;
+      terminateWithEscalation();
+    };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
     const timer = setTimeout(() => {
       killedByTimeout = true;
       terminateWithEscalation();
@@ -572,6 +594,7 @@ export async function runBash(
       closed = true;
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
+      options.signal?.removeEventListener("abort", onAbort);
       const allowTrailingIncompleteUtf8 = killedByTimeout || killedByOutputLimit;
       const stdout = decodeBashOutput(Buffer.concat(stdoutChunks), process.platform, allowTrailingIncompleteUtf8);
       let stderr = decodeBashOutput(Buffer.concat(stderrChunks), process.platform, allowTrailingIncompleteUtf8);
@@ -580,6 +603,10 @@ export async function runBash(
       }
       const out = trimOutput(redactSensitiveText(stdout), config.maxOutputBytes);
       const err = trimOutput(redactSensitiveText(stderr), config.maxOutputBytes);
+      if (cancelledBySignal) {
+        reject(new CodexProError(`Bash command cancelled after ${Date.now() - start} ms; owned process tree was terminated.`));
+        return;
+      }
       resolve({
         command,
         cwd: path.relative(workspace.root, cwd) || ".",

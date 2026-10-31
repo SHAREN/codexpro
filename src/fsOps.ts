@@ -271,8 +271,9 @@ export async function repoTree(config: CodexProConfig, guard: PathGuard, workspa
 export async function listFiles(
   guard: PathGuard,
   workspace: Workspace,
-  options: { root?: string; glob?: string; includeHidden?: boolean; maxFiles: number }
+  options: { root?: string; glob?: string; includeHidden?: boolean; maxFiles: number; signal?: AbortSignal }
 ): Promise<string[]> {
+  if (options.signal?.aborted) throw new CodexProError("Operation cancelled by client.");
   const target = guard.resolve(workspace, options.root ?? ".");
   const stat = await fsp.stat(target.absPath);
   const files: string[] = [];
@@ -286,6 +287,7 @@ export async function listFiles(
   }
 
   async function walk(absDir: string): Promise<void> {
+    if (options.signal?.aborted) throw new CodexProError("Operation cancelled by client.");
     if (files.length >= options.maxFiles) return;
     let entries: fs.Dirent[];
     try {
@@ -295,6 +297,7 @@ export async function listFiles(
     }
     entries.sort((a, b) => a.name.localeCompare(b.name));
     for (const entry of entries) {
+      if (options.signal?.aborted) throw new CodexProError("Operation cancelled by client.");
       if (files.length >= options.maxFiles) return;
       const abs = path.join(absDir, entry.name);
       const rel = displayPath(abs, workspace.root);

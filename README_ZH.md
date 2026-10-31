@@ -197,3 +197,7 @@ codexpro --version
 - [稳定 URL 指南](DOMAIN_SETUP.md)
 - [Changelog](CHANGELOG.md)
 - [Contributors](CONTRIBUTORS.md)
+
+## Runtime 与任务恢复
+
+standard/full 工具模式支持受管 Bash 交接、持久后台 Job、取消/进度通知、持续 Bash、任务检查点与本机 Runtime Console。长时间 Bash 可返回 `running + job_id`，无需让单个 MCP 请求一直阻塞；搜索也有交互预算，并可通过遥测区分服务端执行与客户端在收到结果后的停滞。工具、使用示例、持久化与权限边界见 [Runtime 使用说明](docs/runtime.md)。

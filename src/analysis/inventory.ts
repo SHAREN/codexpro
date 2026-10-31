@@ -6,13 +6,14 @@ import type { PathGuard, Workspace } from "../guard.js";
 import { classifyFileRole, classifyLanguage, isEntrypoint, isGeneratedFile } from "./classify.js";
 import type { InventoryFile, InventoryResult } from "./types.js";
 
-export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuard, workspace: Workspace): Promise<InventoryResult> {
+export async function inventoryWorkspace(config: CodexProConfig, guard: PathGuard, workspace: Workspace, options: { signal?: AbortSignal } = {}): Promise<InventoryResult> {
   const maxFiles = config.analysisLimits.maxInventoryFiles;
-  const candidates = await listFiles(guard, workspace, { root: ".", includeHidden: true, maxFiles: maxFiles + 1 });
+  const candidates = await listFiles(guard, workspace, { root: ".", includeHidden: true, maxFiles: maxFiles + 1, signal: options.signal });
   const truncated = candidates.length > maxFiles;
   const files: InventoryFile[] = [];
 
   for (const candidate of candidates.slice(0, maxFiles)) {
+    if (options.signal?.aborted) throw new Error("Repository analysis cancelled by client.");
     try {
       const resolved = guard.resolve(workspace, candidate);
       const stat = await fsp.stat(resolved.absPath);

@@ -89,7 +89,8 @@ export async function extractWorkspaceFiles(
   config: CodexProConfig,
   guard: PathGuard,
   workspace: Workspace,
-  inventoryFiles: InventoryFile[]
+  inventoryFiles: InventoryFile[],
+  options: { signal?: AbortSignal } = {}
 ): Promise<{ files: ExtractedFile[]; analyzedFiles: number; scannedBytes: number; truncated: boolean; warnings: string[] }> {
   const fileSet = new Set(inventoryFiles.map((file) => file.path));
   const extracted: ExtractedFile[] = [];
@@ -99,6 +100,7 @@ export async function extractWorkspaceFiles(
   let symbolBudgetReached = false;
   let skippedFiles = 0;
   for (const file of inventoryFiles) {
+    if (options.signal?.aborted) throw new Error("Repository analysis cancelled by client.");
     if (!SOURCE_LANGUAGES.has(file.language) || file.generated) continue;
     if (extracted.length >= config.analysisLimits.maxAnalyzedFiles || scannedBytes + file.bytes > config.analysisLimits.maxScannedBytes) {
       sourceBudgetReached = true;
@@ -122,6 +124,7 @@ export async function extractWorkspaceFiles(
     const imports: string[] = [];
     const lines = text.split(/\r?\n/);
     for (let index = 0; index < lines.length; index += 1) {
+      if ((index & 255) === 0 && options.signal?.aborted) throw new Error("Repository analysis cancelled by client.");
       const line = lines[index];
       for (const pattern of DECLARATIONS[file.language] ?? []) {
         const match = line.match(pattern.regex);

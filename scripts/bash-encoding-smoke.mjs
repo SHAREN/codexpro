@@ -88,14 +88,15 @@ assert.deepEqual(wslInvocation.args('printf ok'), ['--exec', 'bash', '-lc', 'pri
 
 if (process.platform === 'win32') {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'codexpro-bash-encoding-')));
-  const config = { bashMode: 'full', maxBashTimeoutMs: 10_000, maxOutputBytes: 100_000, inheritEnv: true, blockedGlobs: [] };
+  const config = { bashMode: 'full', bashRuntime: 'wsl', maxBashTimeoutMs: 10_000, maxOutputBytes: 100_000, inheritEnv: true, blockedGlobs: [] };
   const workspace = { id: 'encoding-smoke', root, openedAt: new Date().toISOString() };
   const gbkPayload = iconv.encode('GBK stdout 中文', 'gbk').toString('base64');
   const childScript = [
     `process.stdout.write(Buffer.from(${JSON.stringify(gbkPayload)}, 'base64'));`,
     "process.stderr.write('UTF-8 stderr 中文');"
   ].join('');
-  const result = await runBash(config, new PathGuard(config), workspace, `${JSON.stringify(process.execPath)} -e ${JSON.stringify(childScript)}`);
+  const nodeCommand = config.bashRuntime === 'wsl' ? 'node.exe' : JSON.stringify(process.execPath);
+  const result = await runBash(config, new PathGuard(config), workspace, `${nodeCommand} -e ${JSON.stringify(childScript)}`);
   assert.equal(result.stdout, 'GBK stdout 中文', `Windows stdout decoding failed: ${JSON.stringify(result)}`);
   assert.equal(result.stderr, 'UTF-8 stderr 中文', `Windows stderr decoding failed: ${JSON.stringify(result)}`);
 }

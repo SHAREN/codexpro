@@ -18,11 +18,13 @@ import {
 } from "./profileStore.js";
 import { redactSensitiveText, redactStructured } from "./redact.js";
 import { createCodexProServer } from "./server.js";
-import { WorkspaceRegistry } from "./guard.js";
+import { WorkspaceManager, WorkspaceRegistry } from "./guard.js";
+import { Runtime } from "./runtimeOps.js";
+import { registerRuntimeConsole } from "./runtimeConsole.js";
 import { redactConfigPaths } from "./pathLabels.js";
 import { CODEXPRO_VERSION } from "./version.js";
 import { runWithMcpRequestContext, type McpRequestContext } from "./requestContext.js";
-import { recordTelemetry, telemetrySnapshot } from "./telemetry.js";
+import { classifySessionState, recordTelemetry, telemetrySnapshot } from "./telemetry.js";
 
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
@@ -1447,6 +1449,10 @@ async function main(): Promise<void> {
   }
 
   const config = loadConfig();
+  const runtime = new Runtime(config);
+  process.once("exit", () => runtime.close());
+  process.once("SIGTERM", () => process.exit(0));
+  process.once("SIGINT", () => process.exit(0));
   if (config.requireHttpToken && !config.authToken) {
     throw new Error(
       "CODEXPRO_HTTP_TOKEN is required for this HTTP binding. " +
@@ -1629,6 +1635,8 @@ async function main(): Promise<void> {
 
   const transports = new Map<string, TransportRecord>();
   const workspaceRegistry = new WorkspaceRegistry();
+  const runtimeWorkspaces = new WorkspaceManager(config, workspaceRegistry);
+  registerRuntimeConsole(app, config, runtimeWorkspaces, runtime);
   const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   function requestSessionId(req: Request): string | undefined {
@@ -1725,7 +1733,7 @@ async function main(): Promise<void> {
     return process.env.CODEXPRO_TELEMETRY !== "0";
   }
 
-  function logMcpRequest(event: "start" | "finish" | "error", context: McpRequestContext, extra: Record<string, unknown> = {}): void {
+  function logMcpRequest(event: "start" | "finish" | "error" | "client_disconnected", context: McpRequestContext, extra: Record<string, unknown> = {}): void {
     if (!logRequests && !telemetryEnabled()) return;
     const ts = new Date().toISOString();
     const payload = {
@@ -1818,6 +1826,10 @@ async function main(): Promise<void> {
     ? Math.max(10_000, Math.min(120_000, Math.floor(configuredSessionHeartbeatMs)))
     : 30_000;
   const sessionHeartbeatWindowMs = Math.min(config.httpSessionTtlMs, 5 * 60_000);
+  const configuredClientStallMs = Number(process.env.CODEXPRO_CLIENT_STALL_MS ?? 30_000);
+  const clientStallMs = Number.isFinite(configuredClientStallMs)
+    ? Math.max(10_000, Math.min(5 * 60_000, Math.floor(configuredClientStallMs)))
+    : 30_000;
   const sessionHeartbeatTimer = (logRequests || telemetryEnabled())
     ? setInterval(() => {
         const now = Date.now();
@@ -1870,7 +1882,13 @@ async function main(): Promise<void> {
           const sinceLastRequestSeenMs = now - record.lastSeenAt;
           const requestActive = record.activeRequests > 0;
           const ts = new Date(now).toISOString();
-          const state = requestActive ? "request_active" : "idle_between_requests";
+          const state = classifySessionState({
+            activeRequests: record.activeRequests,
+            idleForMs: sinceLastRequestSeenMs,
+            lastRequestedTool: record.lastRequestedTool,
+            lastJsonRpcMethod: record.lastJsonRpcMethod,
+            stallThresholdMs: clientStallMs
+          });
           const payload = {
             ts,
             event: "heartbeat",
@@ -1938,7 +1956,8 @@ async function main(): Promise<void> {
       contextDir: config.contextDir,
       authEnabled: Boolean(config.authToken),
       authRequired: Boolean(config.authToken),
-      connection_diagnostics: connectionDiagnostics
+      connection_diagnostics: connectionDiagnostics,
+      client_stall_threshold_ms: clientStallMs
     }, { labelUnknownPaths: true }));
   });
 
@@ -2005,12 +2024,33 @@ async function main(): Promise<void> {
 
     const sessionId = requestSessionId(req);
     const context = mcpRequestContext(req, req.body, sessionId);
+    const requestAbort = new AbortController();
+    context.abortSignal = requestAbort.signal;
     const requestStarted = Date.now();
     const stableClientSession = clientSessionFingerprint(context);
     let requestRecord: TransportRecord | undefined;
+    let normalFinished = false;
+    let disconnectLogged = false;
+
+    const disconnect = (reason: string) => {
+      if (normalFinished || disconnectLogged) return;
+      disconnectLogged = true;
+      requestAbort.abort(new Error(reason));
+      logMcpRequest("client_disconnected", context, {
+        httpMethod: req.method,
+        path: req.path,
+        durationMs: Date.now() - requestStarted,
+        reason
+      });
+    };
+    req.once("aborted", () => disconnect("request_aborted"));
+    res.once("close", () => {
+      if (!res.writableFinished) disconnect("response_closed_before_finish");
+    });
 
     logMcpRequest("start", context, { httpMethod: req.method, path: req.path });
     res.on("finish", () => {
+      normalFinished = true;
       logMcpRequest("finish", context, {
         httpMethod: req.method,
         path: req.path,
@@ -2058,7 +2098,7 @@ async function main(): Promise<void> {
           if (closedSessionId) transports.delete(closedSessionId);
         };
 
-        const server = createCodexProServer(config, { workspaceRegistry });
+        const server = createCodexProServer(config, { workspaceRegistry, runtime });
         await server.connect(transport);
       } else {
         sendSessionError(res, sessionId);
@@ -2075,7 +2115,7 @@ async function main(): Promise<void> {
         error: redactSensitiveText(error instanceof Error ? error.message : String(error))
       });
       console.error(error instanceof Error ? error.stack ?? error.message : String(error));
-      if (!res.headersSent) {
+      if (!res.headersSent && !res.destroyed) {
         res.status(500).json({
           jsonrpc: "2.0",
           error: { code: -32603, message: "Internal CodexPro MCP error. Check the local terminal for details." },
