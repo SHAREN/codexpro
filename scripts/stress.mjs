@@ -569,7 +569,11 @@ async function runMaxReadSearchStress() {
       name: 'read',
       arguments: { workspace_id: opened.structuredContent.workspace_id, path: 'large.txt' }
     });
-    assert(fullRead.isError === true && String(fullRead.structuredContent.error).includes('too large'), 'full read ignored maxReadBytes');
+    assert(fullRead.isError !== true && fullRead.structuredContent.truncated === true &&
+      fullRead.structuredContent.endLine < fullRead.structuredContent.totalLines &&
+      fullRead.structuredContent.text.includes('intro') &&
+      !fullRead.structuredContent.text.includes('needle in large file'),
+      'oversized full read did not return a bounded first chunk');
     const rangedRead = await client.request('tools/call', {
       name: 'read',
       arguments: { workspace_id: opened.structuredContent.workspace_id, path: 'large.txt', start_line: 3, end_line: 3 }
