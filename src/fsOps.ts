@@ -333,10 +333,18 @@ export async function readTextFile(
     throw new CodexProError(`end_line (${endLine}) must be >= start_line (${startLine}).`);
   }
   const selected = allLines.slice(startLine - 1, endLine);
+  // Preserve the original untruncated response for whole-file reads whose raw
+  // content fits the configured cap; line numbers can add overhead.
+  const preserveSmallWholeFile = options.startLine === undefined &&
+    options.endLine === undefined && buffer.byteLength <= maxBytes;
   const numberWidth = String(endLine).length;
   let included = 0;
   let selectedBytes = 0;
   for (const line of selected) {
+    if (preserveSmallWholeFile) {
+      included += 1;
+      continue;
+    }
     const numberedLine = `${String(startLine + included).padStart(numberWidth, " ")} | ${line}`;
     const nextBytes = Buffer.byteLength(numberedLine, "utf8") + (included > 0 ? 1 : 0);
     if (selectedBytes + nextBytes > maxBytes) break;
