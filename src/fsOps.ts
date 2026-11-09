@@ -319,8 +319,10 @@ export async function readTextFile(
 ): Promise<ReadFileResult> {
   const resolved = guard.resolve(workspace, filePath);
   const maxBytes = Math.min(options.maxBytes ?? config.maxReadBytes, config.maxReadBytes);
-  const hasRange = options.startLine !== undefined || options.endLine !== undefined;
-  await guard.assertTextFile(resolved.absPath, hasRange ? textScanByteLimit(config) : maxBytes);
+  // Inspect only files within the existing bounded text-scan safety limit.
+  // A large read returns a complete-line prefix and an endLine cursor instead
+  // of repeatedly failing when the requested range exceeds maxReadBytes.
+  await guard.assertTextFile(resolved.absPath, textScanByteLimit(config));
   const buffer = await fsp.readFile(resolved.absPath);
   const text = buffer.toString("utf8");
   const allLines = splitLines(text);
@@ -331,16 +333,27 @@ export async function readTextFile(
     throw new CodexProError(`end_line (${endLine}) must be >= start_line (${startLine}).`);
   }
   const selected = allLines.slice(startLine - 1, endLine);
-  const numbered = withLineNumbers(selected, startLine);
-  if (hasRange && Buffer.byteLength(numbered, "utf8") > maxBytes) {
-    throw new CodexProError(`Selected line range is too large. Limit: ${maxBytes} bytes.`);
+  const numberWidth = String(endLine).length;
+  let included = 0;
+  let selectedBytes = 0;
+  for (const line of selected) {
+    const numberedLine = `${String(startLine + included).padStart(numberWidth, " ")} | ${line}`;
+    const nextBytes = Buffer.byteLength(numberedLine, "utf8") + (included > 0 ? 1 : 0);
+    if (selectedBytes + nextBytes > maxBytes) break;
+    selectedBytes += nextBytes;
+    included += 1;
   }
-  const truncated = startLine > 1 || endLine < totalLines;
+  if (selected.length > 0 && included === 0) {
+    throw new CodexProError(`Single line at ${startLine} exceeds read limit ${maxBytes} bytes; use a different file inspection method.`);
+  }
+  const actualEndLine = startLine + included - 1;
+  const numbered = withLineNumbers(selected.slice(0, included), startLine);
+  const truncated = startLine > 1 || actualEndLine < totalLines;
   return {
     path: resolved.relPath,
     text: numbered,
     startLine,
-    endLine,
+    endLine: actualEndLine,
     totalLines,
     bytes: buffer.byteLength,
     sha256: sha256(text),
