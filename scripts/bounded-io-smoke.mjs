@@ -53,7 +53,7 @@ try {
     const bin = path.join(root, "bin");
     await fs.mkdir(bin);
     const fakeRg = `#!/usr/bin/env node
-import path from "node:path";
+const path = require("node:path");
 if (process.argv.includes("--version")) {
   console.log("ripgrep smoke");
   process.exit(0);
