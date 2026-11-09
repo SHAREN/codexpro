@@ -92,6 +92,15 @@ function truncateLine(line: string, max = 400): string {
   return `${line.slice(0, max)}…`;
 }
 
+// Bound a recursive search even when a filesystem entry stalls ripgrep.
+// Allow a shorter value for reproducible smoke tests, but never unbounded waits.
+function ripgrepTimeoutMs(): number {
+  const configured = Number(process.env.CODEXPRO_RG_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured >= 250
+    ? Math.min(Math.floor(configured), 60_000)
+    : 20_000;
+}
+
 async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: Workspace, options: SearchOptions): Promise<SearchResult> {
   const target = guard.resolve(workspace, options.root ?? ".");
   const args = [
@@ -121,6 +130,21 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
     let stdout = "";
     let stderr = "";
     let outputLimited = false;
+    let timedOut = false;
+    let escalation: ReturnType<typeof setTimeout> | undefined;
+    const timeoutMs = ripgrepTimeoutMs();
+    const deadline = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      // A stuck child must not hold the MCP response indefinitely.
+      escalation = setTimeout(() => child.kill("SIGKILL"), 2_000);
+      escalation.unref();
+    }, timeoutMs);
+    deadline.unref();
+    const clearDeadline = () => {
+      clearTimeout(deadline);
+      if (escalation) clearTimeout(escalation);
+    };
     child.stdout.on("data", (chunk) => {
       stdout += String(chunk);
       if (!outputLimited && Buffer.byteLength(stdout, "utf8") > config.maxOutputBytes) {
@@ -129,12 +153,13 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
       }
     });
     child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
+      stderr = (stderr + String(chunk)).slice(-8192);
     });
-    child.on("error", reject);
+    child.on("error", (error) => { clearDeadline(); reject(error); });
     child.on("close", (code) => {
-      if (code && code > 1) {
-        reject(new CodexProError(stderr.trim() || `ripgrep failed with exit code ${code}`));
+      clearDeadline();
+      if (!timedOut && !outputLimited && code && code > 1) {
+        reject(new CodexProError(redactSensitiveText(stderr.trim()) || `ripgrep failed with exit code ${code}`));
         return;
       }
       const matches: Array<{ path: string; line: number; text: string }> = [];
@@ -159,8 +184,9 @@ async function runRipgrep(config: CodexProConfig, guard: PathGuard, workspace: W
         const lineText = String(value.data?.lines?.text ?? "").replace(/\r?\n$/, "");
         matches.push({ path: rel || ".", line: Number(value.data?.line_number ?? 0), text: redactSensitiveText(truncateLine(lineText)) });
       }
-      const text = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
-      resolve({ text, matches, truncated: visibleMatches > matches.length || outputLimited, used: "ripgrep" });
+      const summary = matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n") || "No matches.";
+      const text = timedOut ? `${summary}\nSearch timed out after ${timeoutMs} ms; narrow path or glob and retry.` : summary;
+      resolve({ text, matches, truncated: visibleMatches > matches.length || outputLimited || timedOut, used: "ripgrep" });
     });
   });
 }
