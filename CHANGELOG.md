@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Bound recursive ripgrep searches to a default 20-second deadline (configurable via CODEXPRO_RG_TIMEOUT_MS, capped at 60 seconds), returning partial matches with a clear truncation message rather than blocking indefinitely.
+- Return bounded complete-line read chunks with an endLine continuation cursor for text files within the existing scan-size safety limit; preserve full-file SHA-256 and signal truncation.
+
 ## 0.30.3 (2026-10-01)
 
 - Fixed Windows handoff runs that could remain `running` after an npm `.cmd` executor exited by settling from the child exit when inherited output handles never close, terminating the full process tree on timeout, and recording the completion source for diagnostics.
