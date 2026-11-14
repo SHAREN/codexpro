@@ -315,26 +315,47 @@ export async function readTextFile(
   guard: PathGuard,
   workspace: Workspace,
   filePath: string,
-  options: { startLine?: number; endLine?: number; maxBytes?: number } = {}
+  options: { startLine?: number; endLine?: number; maxBytes?: number; truncateToFit?: boolean } = {}
 ): Promise<ReadFileResult> {
   const resolved = guard.resolve(workspace, filePath);
   const maxBytes = Math.min(options.maxBytes ?? config.maxReadBytes, config.maxReadBytes);
+  // Only user-facing MCP reads opt into bounded partial responses. Internal
+  // callers retain strict/full-file semantics to avoid silently partial data.
   const hasRange = options.startLine !== undefined || options.endLine !== undefined;
-  await guard.assertTextFile(resolved.absPath, hasRange ? textScanByteLimit(config) : maxBytes);
+  await guard.assertTextFile(resolved.absPath, options.truncateToFit || hasRange ? textScanByteLimit(config) : maxBytes);
   const buffer = await fsp.readFile(resolved.absPath);
   const text = buffer.toString("utf8");
   const allLines = splitLines(text);
   const totalLines = allLines.length;
   const startLine = Math.max(1, Math.floor(options.startLine ?? 1));
-  const endLine = Math.min(totalLines, Math.floor(options.endLine ?? totalLines));
-  if (endLine < startLine) {
-    throw new CodexProError(`end_line (${endLine}) must be >= start_line (${startLine}).`);
+  const requestedEndLine = Math.min(totalLines, Math.floor(options.endLine ?? totalLines));
+  if (requestedEndLine < startLine) {
+    throw new CodexProError(`end_line (${requestedEndLine}) must be >= start_line (${startLine}).`);
   }
-  const selected = allLines.slice(startLine - 1, endLine);
-  const numbered = withLineNumbers(selected, startLine);
-  if (hasRange && Buffer.byteLength(numbered, "utf8") > maxBytes) {
-    throw new CodexProError(`Selected line range is too large. Limit: ${maxBytes} bytes.`);
+  const requested = allLines.slice(startLine - 1, requestedEndLine);
+  let fit = requested.length;
+  let numbered = withLineNumbers(requested, startLine);
+  if (Buffer.byteLength(numbered, "utf8") > maxBytes) {
+    if (!options.truncateToFit) {
+      throw new CodexProError(`Selected line range is too large. Limit: ${maxBytes} bytes.`);
+    }
+    let low = 0;
+    let high = fit;
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2);
+      if (Buffer.byteLength(withLineNumbers(requested.slice(0, mid), startLine), "utf8") <= maxBytes) {
+        low = mid;
+      } else {
+        high = mid - 1;
+      }
+    }
+    fit = low;
+    if (fit === 0) {
+      throw new CodexProError(`Line ${startLine} alone exceeds max_bytes (${maxBytes}); a complete line cannot be returned.`);
+    }
+    numbered = withLineNumbers(requested.slice(0, fit), startLine);
   }
+  const endLine = startLine + fit - 1;
   const truncated = startLine > 1 || endLine < totalLines;
   return {
     path: resolved.relPath,

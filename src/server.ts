@@ -620,6 +620,11 @@ function toolNamesForMode(config: CodexProConfig): string[] {
     const analysisIndex = names.indexOf("inspect_workspace");
     if (analysisIndex !== -1) names.splice(analysisIndex, 1);
   }
+  // Windows-only tool must not be expected on Linux or Android.
+  if (process.platform !== "win32") {
+    const index = names.indexOf("windows_control");
+    if (index !== -1) names.splice(index, 1);
+  }
   if (config.connectionTest) {
     for (const hiddenTool of CONNECTION_TEST_HIDDEN_TOOLS) {
       const toolIndex = names.indexOf(hiddenTool);
@@ -2104,7 +2109,7 @@ export function createCodexProServer(
     "read",
     {
       title: "Read File",
-      description: "Read a specific text file with line numbers. Avoid rereading files after write/edit/apply_patch unless exact final content is needed.",
+      description: "Read a specific text file with line numbers. Large selections return whole lines within max_bytes and truncated=true; resume with start_line=endLine+1. Avoid rereading files after write/edit/apply_patch unless exact final content is needed.",
       inputSchema: {
         workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
         path: z.string().describe("File path relative to workspace root."),
@@ -2124,7 +2129,8 @@ export function createCodexProServer(
       const result = await readTextFile(config, guard, workspace, args.path, {
         startLine: args.start_line,
         endLine: args.end_line,
-        maxBytes: args.max_bytes
+        maxBytes: args.max_bytes,
+        truncateToFit: true
       });
       const text = `# Read File\n\nPath: ${result.path}\nLines: ${result.startLine}-${result.endLine} of ${result.totalLines}\nBytes: ${result.bytes}\nSHA-256: ${result.sha256}\n\n\`\`\`text\n${result.text}\n\`\`\``;
       return textResult(text, { workspace_id: workspace.id, root: workspace.root, ...result });
