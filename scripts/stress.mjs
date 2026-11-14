@@ -557,7 +557,7 @@ async function runMaxReadSearchStress() {
   await fs.writeFile(path.join(root, 'many-lines.txt'), `${Array.from({ length: 1200 }, (_, i) => `x${i % 10}`).join('\n')}\n`, 'utf8');
   await fs.writeFile(path.join(root, 'large.txt'), `intro\n${'x'.repeat(4500)}\nneedle in large file\n`, 'utf8');
   await fs.writeFile(path.join(root, 'huge.txt'), `needle in huge file\n${'x'.repeat(20000)}\n`, 'utf8');
-  const client = await initClient(root, { CODEXPRO_MAX_READ_BYTES: '1000' });
+  const client = await initClient(root, { CODEXPRO_MAX_READ_BYTES: '4000' });
   try {
     const opened = await client.request('tools/call', { name: 'open_current_workspace', arguments: { include_tree: false } });
     const manyLinesRead = await client.request('tools/call', {
@@ -565,7 +565,7 @@ async function runMaxReadSearchStress() {
       arguments: { workspace_id: opened.structuredContent.workspace_id, path: 'many-lines.txt' }
     });
     const head = manyLinesRead.structuredContent;
-    assert(manyLinesRead.isError !== true && head.truncated === true && head.endLine > 0 && head.endLine < 1201 && Buffer.byteLength(head.text, 'utf8') <= 1000, 'line-numbered read should be bounded to maxReadBytes');
+    assert(manyLinesRead.isError !== true && head.truncated === true && head.endLine > 0 && head.endLine < 1201 && Buffer.byteLength(head.text, 'utf8') <= 4000, 'line-numbered read should be bounded to maxReadBytes');
     const continuation = await client.request('tools/call', {
       name: 'read',
       arguments: { workspace_id: opened.structuredContent.workspace_id, path: 'many-lines.txt', start_line: head.endLine + 1 }
