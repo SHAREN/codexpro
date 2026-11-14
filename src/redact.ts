@@ -20,6 +20,30 @@ export function hasSecretValue(text: string): boolean {
   return false;
 }
 
+// Editing existing test fixtures must not be blocked by unchanged redacted-looking
+// values. Reject every newly introduced match, including duplicate credentials or
+// matches assembled across the edited span and surrounding unchanged text.
+export function hasNewSecretValue(before: string, after: string): boolean {
+  const existing = new Map<string, number>();
+  const scan = (text: string, consume: (value: string) => void): void => {
+    for (const pattern of SECRET_PATTERNS) {
+      pattern.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = pattern.exec(text)) !== null) {
+        if (!isPlaceholderSecret(match[0])) consume(match[0]);
+      }
+    }
+  };
+  scan(before, (value) => existing.set(value, (existing.get(value) ?? 0) + 1));
+  let newMatch = false;
+  scan(after, (value) => {
+    const remaining = existing.get(value) ?? 0;
+    if (remaining === 0) newMatch = true;
+    else existing.set(value, remaining - 1);
+  });
+  return newMatch;
+}
+
 export function redactSensitiveText(text: string): string {
   return text
     .replace(CODEXPRO_TOKEN_ASSIGNMENT_PATTERN, (_match, prefix) => `${prefix}[REDACTED_SECRET]`)
