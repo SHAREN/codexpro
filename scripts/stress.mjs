@@ -564,12 +564,23 @@ async function runMaxReadSearchStress() {
       name: 'read',
       arguments: { workspace_id: opened.structuredContent.workspace_id, path: 'many-lines.txt' }
     });
-    assert(manyLinesRead.isError !== true && manyLinesRead.structuredContent.endLine === 1201, `full read under maxReadBytes failed after line numbering: ${JSON.stringify(manyLinesRead.structuredContent)}`);
+    const head = manyLinesRead.structuredContent;
+    assert(manyLinesRead.isError !== true && head.truncated === true && head.endLine > 0 && head.endLine < 1201 && Buffer.byteLength(head.text, 'utf8') <= 1000, 'line-numbered read should be bounded to maxReadBytes');
+    const continuation = await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: opened.structuredContent.workspace_id, path: 'many-lines.txt', start_line: head.endLine + 1 }
+    });
+    assert(continuation.isError !== true && continuation.structuredContent.startLine === head.endLine + 1 && continuation.structuredContent.sha256 === head.sha256, 'bounded read must resume at the next line');
     const fullRead = await client.request('tools/call', {
       name: 'read',
       arguments: { workspace_id: opened.structuredContent.workspace_id, path: 'large.txt' }
     });
-    assert(fullRead.isError === true && String(fullRead.structuredContent.error).includes('too large'), 'full read ignored maxReadBytes');
+    assert(fullRead.isError !== true && fullRead.structuredContent.truncated === true && fullRead.structuredContent.endLine === 1, 'large file must return only its complete first line');
+    const oversizedLine = await client.request('tools/call', {
+      name: 'read',
+      arguments: { workspace_id: opened.structuredContent.workspace_id, path: 'large.txt', start_line: 2, end_line: 2 }
+    });
+    assert(oversizedLine.isError === true && String(oversizedLine.structuredContent.error).includes('Line 2 alone exceeds max_bytes'), 'a single oversized line must be rejected rather than split');
     const rangedRead = await client.request('tools/call', {
       name: 'read',
       arguments: { workspace_id: opened.structuredContent.workspace_id, path: 'large.txt', start_line: 3, end_line: 3 }
